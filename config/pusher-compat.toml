@@ -1,0 +1,18 @@
+# Pusher-compatible configuration for running official SDK acceptance tests.
+# Enforces Pusher's default limits for API parity.
+
+host = "0.0.0.0"
+port = 6001
+
+[ssl]
+enabled = false
+
+[[apps]]
+id = "123456"
+key = "rushsocket-key"
+secret = "rushsocket-secret"
+
+# Pusher defaults
+max_event_payload_in_kb = 10
+max_event_batch_size = 10
+max_event_channels_at_once = 100

@@ -1,0 +1,89 @@
+[package]
+name = "rushsocket"
+version = "1.0.0"
+edition = "2024"
+description = "A Pusher Protocol v7 compatible WebSocket server written in Rust"
+license = "MIT OR Apache-2.0"
+homepage = "https://rushsocket.xyz"
+repository = "https://github.com/rushsocket/rushsocket"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "macros"] }
+
+# HTTP + WebSocket
+axum = { version = "0.8", features = ["ws"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
+tower = { version = "0.5", features = ["util", "timeout", "limit", "load-shed"] }
+tower-http = { version = "0.6", features = ["cors", "request-id"] }
+hyper = { version = "1", features = ["full"] }
+
+# TLS
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+subtle = "2"
+
+# Concurrent data structures
+dashmap = "6"
+parking_lot = "0.12"
+
+# Redis
+redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
+deadpool-redis = "0.23"
+
+# Rate limiting
+governor = "0.10"
+
+# Config
+config = "0.15"
+clap = { version = "4", features = ["derive"] }
+toml = "1"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Async trait
+async-trait = "0.1"
+
+# Error handling
+anyhow = "1"
+
+# HTTP client (webhooks)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Misc
+rand = "0.10"
+futures-util = "0.3"
+tokio-stream = "0.1"
+bytes = "1"
+url = "2"
+
+# Allocator (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"
+sd-notify = "0.4"
+
+[dev-dependencies]
+tokio-tungstenite = "0.26"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+async-stream = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

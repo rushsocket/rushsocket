@@ -1,0 +1,29 @@
+# rushsocket configuration
+# See README.md for the full configuration reference.
+
+# Bind address — must be an IP literal (e.g. "0.0.0.0", "127.0.0.1"), not a hostname.
+# host = "0.0.0.0"
+# port = 6001
+
+# HTTP body size ceilings (KB). Applied at the transport layer before handlers run.
+# max_http_event_body_kb = 64
+# max_http_batch_body_kb = 1280
+
+# Max concurrent API requests (0 = unlimited). Health routes are never limited.
+# max_concurrent_http_requests = 256
+
+# Shutdown timing (seconds).
+# shutdown_drain_period: wait for WS connections to drain after SIGTERM.
+# shutdown_grace_period: hard timeout for in-flight HTTP after drain.
+# shutdown_drain_period = 10
+# shutdown_grace_period = 6
+
+[ssl]
+enabled = false
+cert_path = "certs/cert.pem"
+key_path = "certs/key.pem"
+
+[[apps]]
+id = "rushsocket-id"
+key = "rushsocket-key"
+secret = "rushsocket-secret"
