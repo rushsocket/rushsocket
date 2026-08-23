@@ -87,7 +87,7 @@ curl -sSfL https://raw.githubusercontent.com/rushsocket/rushsocket/main/install.
 To install a specific version:
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/rushsocket/rushsocket/main/install.sh | sudo bash -s -- v1.0.0
+curl -sSfL https://raw.githubusercontent.com/rushsocket/rushsocket/main/install.sh | sudo bash -s -- v1.1.0
 ```
 
 Supported platforms: **Linux** and **macOS** only. Windows is not supported.

@@ -5,11 +5,13 @@ use std::time::Duration;
 use dashmap::DashMap;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use super::request_response::{Request, RequestType, Response, ResponsePayload};
 use crate::config::RedisConfig;
+use crate::metrics::Metrics;
 
 const BROADCAST_SUFFIX: &str = "#broadcast";
 const REQUEST_SUFFIX: &str = "#request";
@@ -68,14 +70,80 @@ pub struct RpcBatch {
     pub responses: Vec<ResponsePayload>,
 }
 
+/// Multiplexed connection plus a slot generation independent of subscribe `generation`.
+type MuxSlot = tokio::sync::RwLock<(u64, redis::aio::MultiplexedConnection)>;
+
+/// Write-swap iff `expected` still matches. On loss, return `new_val` so the caller can drop it.
+async fn swap_if_gen<T>(
+    slot: &tokio::sync::RwLock<(u64, T)>,
+    expected: u64,
+    new_val: T,
+) -> Result<(), T> {
+    let mut g = slot.write().await;
+    if g.0 == expected {
+        g.0 = expected.wrapping_add(1);
+        g.1 = new_val;
+        Ok(())
+    } else {
+        Err(new_val)
+    }
+}
+
+async fn try_publish(
+    conn: &mut redis::aio::MultiplexedConnection,
+    channel: &str,
+    json: &str,
+) -> Result<(), redis::RedisError> {
+    conn.publish::<_, _, ()>(channel, json).await
+}
+
+/// One-pass publish: clone handle, I/O, on error retry a fresh clone, then open a new mux
+/// with no write lock held, CAS-swap, publish once more. Never assign onto a stale clone.
+async fn publish_with_reconnect(
+    slot: &MuxSlot,
+    redis_url: &str,
+    channel: &str,
+    json: &str,
+) -> Result<(), redis::RedisError> {
+    let (slot_gen, mut conn) = {
+        let g = slot.read().await;
+        (g.0, g.1.clone())
+    };
+    if try_publish(&mut conn, channel, json).await.is_ok() {
+        return Ok(());
+    }
+    let (slot_gen2, mut conn2) = {
+        let g = slot.read().await;
+        (g.0, g.1.clone())
+    };
+    if slot_gen2 != slot_gen {
+        return try_publish(&mut conn2, channel, json).await;
+    }
+    warn!("Publish failed, attempting to reconnect");
+    let client = redis::Client::open(redis_url)?;
+    let new_conn = client.get_multiplexed_async_connection().await?;
+    match swap_if_gen(slot, slot_gen2, new_conn).await {
+        Ok(()) => {}
+        Err(_dropped) => {
+            // Lost CAS: extra TCP is dropped; retry on the winner's handle.
+        }
+    }
+    let mut conn3 = slot.read().await.1.clone();
+    let result = try_publish(&mut conn3, channel, json).await;
+    if result.is_ok() {
+        info!("Publisher reconnected successfully");
+    }
+    result
+}
+
 pub struct RedisPubSub {
     /// Redis URL for creating connections.
     redis_url: String,
     /// Connection for broadcast publishes (channel messages, heartbeats).
-    broadcast_conn: tokio::sync::Mutex<redis::aio::MultiplexedConnection>,
+    broadcast_conn: MuxSlot,
     /// Connection for control-plane publishes (requests, responses).
     /// Separated from broadcast to prevent head-of-line blocking under bursty fan-out.
-    control_conn: tokio::sync::Mutex<redis::aio::MultiplexedConnection>,
+    control_conn: MuxSlot,
     /// Channel prefix.
     prefix: String,
     /// Timeout for cross-node requests.
@@ -92,18 +160,33 @@ pub struct RedisPubSub {
     /// Discovery tasks capture the current generation and only set subscribed = true
     /// if it still matches, preventing stale tasks from flipping readiness.
     generation: AtomicU64,
+    pub(crate) metrics: Arc<Metrics>,
+}
+
+struct BroadcastWork {
+    sender_node: String,
+    payload: BroadcastMessage,
+}
+
+struct ResponseWork {
+    target_node: String,
+    response: Response,
 }
 
 impl RedisPubSub {
-    pub async fn new(config: &RedisConfig, node_id: &str) -> Result<Self, redis::RedisError> {
+    pub async fn new(
+        config: &RedisConfig,
+        node_id: &str,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self, redis::RedisError> {
         let client = redis::Client::open(config.url.as_str())?;
         let broadcast_conn = client.get_multiplexed_async_connection().await?;
         let control_conn = client.get_multiplexed_async_connection().await?;
 
         Ok(Self {
             redis_url: config.url.clone(),
-            broadcast_conn: tokio::sync::Mutex::new(broadcast_conn),
-            control_conn: tokio::sync::Mutex::new(control_conn),
+            broadcast_conn: tokio::sync::RwLock::new((0, broadcast_conn)),
+            control_conn: tokio::sync::RwLock::new((0, control_conn)),
             prefix: config.prefix.clone(),
             request_timeout: Duration::from_millis(config.request_timeout),
             pending: DashMap::new(),
@@ -111,6 +194,7 @@ impl RedisPubSub {
             known_nodes: DashMap::new(),
             subscribed: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            metrics,
         })
     }
 
@@ -137,31 +221,13 @@ impl RedisPubSub {
             payload: PubSubPayload::Broadcast(message.clone()),
         };
         let json = serde_json::to_string(&envelope).unwrap_or_default();
-
-        let mut conn = self.broadcast_conn.lock().await;
-        match conn
-            .publish::<_, _, ()>(&self.broadcast_channel(), &json)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                warn!("Broadcast publish failed, attempting to reconnect: {}", e);
-                match redis::Client::open(self.redis_url.as_str()) {
-                    Ok(client) => {
-                        if let Ok(new_conn) = client.get_multiplexed_async_connection().await {
-                            *conn = new_conn;
-                            conn.publish::<_, _, ()>(&self.broadcast_channel(), &json)
-                                .await?;
-                            info!("Broadcast publisher reconnected successfully");
-                            Ok(())
-                        } else {
-                            Err(e)
-                        }
-                    }
-                    Err(_) => Err(e),
-                }
-            }
-        }
+        publish_with_reconnect(
+            &self.broadcast_conn,
+            &self.redis_url,
+            &self.broadcast_channel(),
+            &json,
+        )
+        .await
     }
 
     /// Send a request to all other nodes and collect responses.
@@ -206,19 +272,16 @@ impl RedisPubSub {
         };
         let json = serde_json::to_string(&envelope).unwrap_or_default();
 
+        if let Err(e) = publish_with_reconnect(
+            &self.control_conn,
+            &self.redis_url,
+            &self.request_channel(),
+            &json,
+        )
+        .await
         {
-            let mut conn = self.control_conn.lock().await;
-            if let Err(e) = Self::publish_with_reconnect(
-                &mut conn,
-                &self.redis_url,
-                &self.request_channel(),
-                &json,
-            )
-            .await
-            {
-                self.pending.remove(&request_id);
-                return Err(e);
-            }
+            self.pending.remove(&request_id);
+            return Err(e);
         }
 
         // Wait for responses with timeout
@@ -289,11 +352,13 @@ impl RedisPubSub {
         let json = serde_json::to_string(&envelope).unwrap_or_default();
 
         // Publish unconditionally — we don't know if peers exist yet
-        let publish_result = {
-            let mut conn = self.control_conn.lock().await;
-            Self::publish_with_reconnect(&mut conn, &self.redis_url, &self.request_channel(), &json)
-                .await
-        };
+        let publish_result = publish_with_reconnect(
+            &self.control_conn,
+            &self.redis_url,
+            &self.request_channel(),
+            &json,
+        )
+        .await;
         if let Err(e) = publish_result {
             warn!("Failed to publish discover request: {}", e);
             self.pending.remove(&request_id);
@@ -317,7 +382,7 @@ impl RedisPubSub {
             if guard.responses.len() >= guard.expected_count
                 && let Some(tx) = guard.tx.take()
             {
-                let _ = tx.send(guard.responses.clone());
+                let _ = tx.send(std::mem::take(&mut guard.responses));
             }
         }
     }
@@ -334,36 +399,13 @@ impl RedisPubSub {
             payload: PubSubPayload::Response(response),
         };
         let json = serde_json::to_string(&envelope).unwrap_or_default();
-
-        let mut conn = self.control_conn.lock().await;
-        Self::publish_with_reconnect(&mut conn, &self.redis_url, &response_channel, &json).await
-    }
-
-    async fn publish_with_reconnect(
-        conn: &mut redis::aio::MultiplexedConnection,
-        redis_url: &str,
-        channel: &str,
-        json: &str,
-    ) -> Result<(), redis::RedisError> {
-        match conn.publish::<_, _, ()>(channel, json).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                warn!("Control publish failed, attempting to reconnect: {}", e);
-                match redis::Client::open(redis_url) {
-                    Ok(client) => {
-                        if let Ok(new_conn) = client.get_multiplexed_async_connection().await {
-                            *conn = new_conn;
-                            conn.publish::<_, _, ()>(channel, json).await?;
-                            info!("Control publisher reconnected successfully");
-                            Ok(())
-                        } else {
-                            Err(e)
-                        }
-                    }
-                    Err(_) => Err(e),
-                }
-            }
-        }
+        publish_with_reconnect(
+            &self.control_conn,
+            &self.redis_url,
+            &response_channel,
+            &json,
+        )
+        .await
     }
 
     /// Record that a peer node is alive (called on any message from that node).
@@ -396,35 +438,56 @@ impl RedisPubSub {
         self.known_nodes.iter().map(|e| e.key().clone()).collect()
     }
 
-    /// Subscribe and listen for messages. Runs forever with automatic reconnect.
+    /// Subscribe and listen for messages. Returns when worker senders are Closed.
+    /// Subscribe-socket death reconnects inside this call with the same senders.
     pub async fn listen(self: Arc<Self>, adapter: Arc<super::RedisAdapter>) {
+        let (fanout_tx, mut fanout_rx) = mpsc::channel::<BroadcastWork>(1024);
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<ResponseWork>();
+
+        let adapter_fan = adapter.clone();
+        tokio::spawn(async move {
+            while let Some(work) = fanout_rx.recv().await {
+                adapter_fan
+                    .handle_broadcast(&work.sender_node, &work.payload)
+                    .await;
+            }
+        });
+        let responder = self.clone();
+        tokio::spawn(async move {
+            while let Some(work) = resp_rx.recv().await {
+                if let Err(e) = responder
+                    .send_response(&work.target_node, work.response)
+                    .await
+                {
+                    warn!("Failed to send response: {}", e);
+                }
+            }
+        });
+
         let broadcast_ch = self.broadcast_channel();
         let request_ch = self.request_channel();
         let response_ch = self.response_channel();
 
-        // Spawn the heartbeat publisher — keeps Redis connections alive
-        let heartbeat_self = self.clone();
-        tokio::spawn(async move {
-            heartbeat_self.heartbeat_loop().await;
-        });
-
-        // Main subscriber loop with reconnect
         loop {
-            // Mark not-ready and bump generation on each (re)connect attempt.
-            // Stale discovery tasks from a previous generation will see the mismatch
-            // and skip setting subscribed = true.
             self.subscribed.store(false, Ordering::Relaxed);
             self.generation.fetch_add(1, Ordering::Relaxed);
 
             match self
-                .subscribe_loop(&adapter, &broadcast_ch, &request_ch, &response_ch)
+                .subscribe_loop(
+                    &adapter,
+                    &broadcast_ch,
+                    &request_ch,
+                    &response_ch,
+                    &fanout_tx,
+                    &resp_tx,
+                )
                 .await
             {
-                Ok(()) => break,
+                Ok(()) => {
+                    info!("Redis listen ended (worker senders closed)");
+                    break;
+                }
                 Err(e) => {
-                    // Immediately invalidate readiness so any in-flight discovery
-                    // task from this generation cannot flip subscribed back to true
-                    // during the sleep window.
                     self.subscribed.store(false, Ordering::Relaxed);
                     self.generation.fetch_add(1, Ordering::Relaxed);
                     error!("Redis subscribe loop error: {}, reconnecting in 1s...", e);
@@ -437,7 +500,7 @@ impl RedisPubSub {
     /// Periodically publish a heartbeat to keep the Redis pub/sub connection alive.
     /// This ensures traffic flows even when no real events are happening,
     /// preventing silent TCP death from load balancer idle timeouts.
-    async fn heartbeat_loop(self: Arc<Self>) {
+    pub(crate) async fn heartbeat_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL)).await;
 
@@ -458,6 +521,8 @@ impl RedisPubSub {
         broadcast_ch: &str,
         request_ch: &str,
         response_ch: &str,
+        fanout_tx: &mpsc::Sender<BroadcastWork>,
+        resp_tx: &mpsc::UnboundedSender<ResponseWork>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = redis::Client::open(self.redis_url.as_str())?;
         let mut pubsub = client.get_async_pubsub().await?;
@@ -534,23 +599,29 @@ impl RedisPubSub {
                         }
                     };
 
-                    // Skip own messages (except we still record them as activity)
                     if envelope.sender_node == self.node_id {
                         continue;
                     }
 
-                    // Track this peer as alive
                     self.record_peer(&envelope.sender_node);
 
                     match envelope.payload {
                         PubSubPayload::Broadcast(BroadcastMessage::Heartbeat) => {
-                            // Heartbeat from another node — just keep-alive, no action needed
                             debug!("Heartbeat received from {}", envelope.sender_node);
                         }
                         PubSubPayload::Broadcast(broadcast) => {
-                            adapter
-                                .handle_broadcast(&envelope.sender_node, &broadcast)
-                                .await;
+                            match fanout_tx.try_send(BroadcastWork {
+                                sender_node: envelope.sender_node,
+                                payload: broadcast,
+                            }) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    self.metrics
+                                        .pubsub_broadcast_dropped
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                            }
                         }
                         PubSubPayload::Request(request) => {
                             let response_payload = adapter.handle_request(&request).await;
@@ -559,9 +630,14 @@ impl RedisPubSub {
                                 responder_node: self.node_id.clone(),
                                 payload: response_payload,
                             };
-                            if let Err(e) = self.send_response(&request.sender_node, response).await
+                            if resp_tx
+                                .send(ResponseWork {
+                                    target_node: request.sender_node,
+                                    response,
+                                })
+                                .is_err()
                             {
-                                warn!("Failed to send response: {}", e);
+                                return Ok(());
                             }
                         }
                         PubSubPayload::Response(response) => {
@@ -588,5 +664,54 @@ impl RedisPubSub {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::swap_if_gen;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn concurrent_swap_one_winner_losers_drop() {
+        let slot = Arc::new(RwLock::new((0u64, 0u32)));
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let wins = Arc::new(AtomicU64::new(0));
+        let drops = Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::new();
+        for i in 1..=8u32 {
+            let slot = slot.clone();
+            let barrier = barrier.clone();
+            let wins = wins.clone();
+            let drops = drops.clone();
+            tasks.push(tokio::spawn(async move {
+                let expected = slot.read().await.0;
+                barrier.wait().await;
+                match swap_if_gen(&slot, expected, i).await {
+                    Ok(()) => {
+                        wins.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(val) => {
+                        drops.fetch_add(1, Ordering::SeqCst);
+                        let current = slot.read().await.0;
+                        let _ = swap_if_gen(&slot, current, val).await;
+                    }
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(wins.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 7);
+        let g = slot.read().await;
+        assert!(
+            g.0 >= 2,
+            "losers must retry on the current slot so gen advances past the first swap, gen={}",
+            g.0
+        );
+        assert!(g.1 >= 1 && g.1 <= 8);
     }
 }

@@ -81,6 +81,19 @@ pub trait Adapter: Send + Sync + 'static {
     /// Get the number of sockets in a channel.
     async fn get_channel_socket_count(&self, app_id: &str, channel: &str) -> usize;
 
+    /// Batch channel socket counts. Default loops `get_channel_socket_count`.
+    async fn get_channel_socket_counts(
+        &self,
+        app_id: &str,
+        channels: &[String],
+    ) -> HashMap<String, usize> {
+        let mut out = HashMap::new();
+        for ch in channels {
+            out.insert(ch.clone(), self.get_channel_socket_count(app_id, ch).await);
+        }
+        out
+    }
+
     /// Get presence members for a channel: user_id -> user_info.
     async fn get_presence_members(
         &self,

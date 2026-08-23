@@ -37,6 +37,7 @@ impl AppState {
         app_manager: Arc<dyn AppManager>,
         adapter: Arc<dyn Adapter>,
         cache: Arc<dyn CacheDriver>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         let (cached_stats_tx, cached_stats) = watch::channel(serde_json::json!({}));
 
@@ -52,7 +53,7 @@ impl AppState {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("webhook HTTP client");
-            Some(WebhookManager::new(&apps, client))
+            Some(WebhookManager::new(&apps, client, metrics.clone()))
         } else {
             None
         };
@@ -63,7 +64,7 @@ impl AppState {
             config,
             app_manager,
             adapter,
-            metrics: Arc::new(Metrics::new()),
+            metrics,
             rate_limiter: Arc::new(LocalRateLimiter::new()),
             cache,
             closing: AtomicBool::new(false),

@@ -55,22 +55,33 @@ pub async fn list_channels(
     }
 
     let channels = state.adapter.get_channels(&app_id).await;
+    let filtered: Vec<String> = channels
+        .into_iter()
+        .filter(|channel| {
+            filter_prefix
+                .as_ref()
+                .map(|prefix| channel.starts_with(prefix.as_str()))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    let want_sub = info_attrs.iter().any(|v| v == "subscription_count");
+    let counts = if want_sub {
+        state
+            .adapter
+            .get_channel_socket_counts(&app_id, &filtered)
+            .await
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mut result = serde_json::Map::new();
 
-    for channel in channels {
-        if let Some(ref prefix) = filter_prefix
-            && !channel.starts_with(prefix.as_str())
-        {
-            continue;
-        }
-
+    for channel in filtered {
         let mut info = serde_json::Map::new();
 
-        if info_attrs.contains(&"subscription_count".to_string()) {
-            let count = state
-                .adapter
-                .get_channel_socket_count(&app_id, &channel)
-                .await;
+        if want_sub {
+            let count = counts.get(&channel).copied().unwrap_or(0);
             info.insert("subscription_count".to_string(), serde_json::json!(count));
         }
 

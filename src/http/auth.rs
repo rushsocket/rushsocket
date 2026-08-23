@@ -153,7 +153,13 @@ mod tests {
         let adapter = Arc::new(crate::adapter::local::LocalAdapter::new());
         let cache: Arc<dyn crate::cache::CacheDriver> =
             Arc::new(crate::cache::memory::MemoryCache::new());
-        Arc::new(AppState::new_with_cache(cfg, manager, adapter, cache))
+        Arc::new(AppState::new_with_cache(
+            cfg,
+            manager,
+            adapter,
+            cache,
+            Arc::new(crate::metrics::Metrics::new()),
+        ))
     }
 
     #[test]

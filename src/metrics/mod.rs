@@ -13,6 +13,10 @@ pub struct Metrics {
     pub http_calls: AtomicU64,
     pub http_bytes_received: AtomicU64,
     pub http_bytes_sent: AtomicU64,
+    pub pubsub_broadcast_dropped: AtomicU64,
+    pub webhook_events_dropped: AtomicU64,
+    /// Vacate RPC waiter got fewer replies than `expected` (timeout/partial).
+    pub vacate_rpc_incomplete: AtomicU64,
     pub per_app: DashMap<String, AppMetrics>,
 }
 
@@ -65,6 +69,9 @@ impl Metrics {
             http_calls: AtomicU64::new(0),
             http_bytes_received: AtomicU64::new(0),
             http_bytes_sent: AtomicU64::new(0),
+            pubsub_broadcast_dropped: AtomicU64::new(0),
+            webhook_events_dropped: AtomicU64::new(0),
+            vacate_rpc_incomplete: AtomicU64::new(0),
             per_app: DashMap::new(),
         }
     }

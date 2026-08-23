@@ -2,7 +2,17 @@
 
 ## Unreleased
 
+## 1.1.0 - 2026-08-23
+
+### Performance
+- Channel fan-out snapshots connection handles and drops the DashMap shard guard before `send_raw`.
+- Redis adapter commands clone the multiplexed connection instead of holding a mutex across RTT; publish reconnect is a generation slot-swap.
+- Redis subscriber loop is parse+dispatch only: incoming RPC responses stay on the reader, broadcasts go to a bounded worker, occupancy replies are unbounded.
+- `GET /channels` and REST `info=subscription_count` use one `node_stats` MGET for the count pass, not one per channel.
+- Webhook queue is bounded (4096); HTTP retries run off the batch loop. `/stats` reports `drops.pubsub_broadcast` and `drops.webhook_events`.
+
 ### Fixed
+- Cross-node vacate RPC count replies serialize as `Count { count }` so peers can deserialize the integer (internally tagged `Count(usize)` was `{"type":"Count"}` with no value, so vacate saw `received=0`).
 - REST `auth_timestamp` window is symmetric `|now-ts|` (future timestamps no longer replay forever).
 - Invalid `metrics_host` (e.g. `localhost`) fails config load instead of inheriting the public WS bind.
 - Webhook HTTP client does not follow redirects (HMAC headers stay on the configured URL).

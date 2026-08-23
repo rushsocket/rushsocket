@@ -2,13 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
+use bytes::Bytes;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, warn};
 
 use crate::app::App;
+use crate::metrics::Metrics;
 
 /// Flush a webhook batch once it reaches this many events, even if the interval has not elapsed.
 pub const WEBHOOK_BATCH_MAX: usize = 10;
+pub const WEBHOOK_QUEUE_CAP: usize = 4096;
+const WEBHOOK_DELIVER_PERMITS: usize = 4;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WebhookEvent {
@@ -37,8 +41,9 @@ struct WebhookWorker {
     key: String,
     secret: String,
     client: reqwest::Client,
-    rx: mpsc::UnboundedReceiver<WebhookEvent>,
+    rx: mpsc::Receiver<WebhookEvent>,
     batch_interval_ms: u64,
+    semaphore: Arc<Semaphore>,
 }
 
 impl WebhookWorker {
@@ -57,12 +62,12 @@ impl WebhookWorker {
                         Some(e) => {
                             batch.push(e);
                             if batch.len() >= WEBHOOK_BATCH_MAX {
-                                self.flush(&mut batch).await;
+                                self.flush(&mut batch);
                             }
                         }
                         None => {
                             if !batch.is_empty() {
-                                self.flush(&mut batch).await;
+                                self.flush(&mut batch);
                             }
                             return;
                         }
@@ -70,92 +75,104 @@ impl WebhookWorker {
                 }
                 _ = ticker.tick() => {
                     if !batch.is_empty() {
-                        self.flush(&mut batch).await;
+                        self.flush(&mut batch);
                     }
                 }
             }
         }
     }
 
-    async fn flush(&self, batch: &mut Vec<WebhookEvent>) {
+    fn flush(&self, batch: &mut Vec<WebhookEvent>) {
         let events: Vec<WebhookEvent> = std::mem::take(batch);
+        let event_count = events.len();
         let time_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
 
         let payload = WebhookPayload { time_ms, events };
-        let body = match serde_json::to_string(&payload) {
+        let body_str = match serde_json::to_string(&payload) {
             Ok(b) => b,
             Err(e) => {
                 warn!(error = %e, "Failed to serialize webhook payload");
                 return;
             }
         };
+        let body = Bytes::from(body_str);
+        let signature =
+            crate::auth::sign(&self.secret, std::str::from_utf8(&body).unwrap_or_default());
 
-        let signature = crate::auth::sign(&self.secret, &body);
-
-        // Retry up to 3 times with exponential backoff
-        for attempt in 0..3u32 {
-            if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1 << attempt)).await;
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let key = self.key.clone();
+        let semaphore = self.semaphore.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = semaphore.acquire_owned().await else {
+                return;
+            };
+            for attempt in 0..3u32 {
+                if attempt > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1 << attempt)).await;
+                }
+                match client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .header("X-Pusher-Key", &key)
+                    .header("X-Pusher-Signature", &signature)
+                    .body(body.clone())
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        debug!(url = %url, events = event_count, "Webhook delivered");
+                        return;
+                    }
+                    Ok(resp) if resp.status().is_redirection() => {
+                        warn!(
+                            url = %url,
+                            status = %resp.status(),
+                            attempt = attempt + 1,
+                            "Webhook redirect not followed"
+                        );
+                    }
+                    Ok(resp) => {
+                        warn!(
+                            url = %url,
+                            status = %resp.status(),
+                            attempt = attempt + 1,
+                            "Webhook delivery failed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            url = %url,
+                            error = %e,
+                            attempt = attempt + 1,
+                            "Webhook request error"
+                        );
+                    }
+                }
             }
-
-            match self
-                .client
-                .post(&self.url)
-                .header("Content-Type", "application/json")
-                .header("X-Pusher-Key", &self.key)
-                .header("X-Pusher-Signature", &signature)
-                .body(body.clone())
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    debug!(url = %self.url, events = payload.events.len(), "Webhook delivered");
-                    return;
-                }
-                Ok(resp) if resp.status().is_redirection() => {
-                    warn!(
-                        url = %self.url,
-                        status = %resp.status(),
-                        attempt = attempt + 1,
-                        "Webhook redirect not followed"
-                    );
-                }
-                Ok(resp) => {
-                    warn!(
-                        url = %self.url,
-                        status = %resp.status(),
-                        attempt = attempt + 1,
-                        "Webhook delivery failed"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        url = %self.url,
-                        error = %e,
-                        attempt = attempt + 1,
-                        "Webhook request error"
-                    );
-                }
-            }
-        }
-
-        warn!(url = %self.url, "Webhook delivery failed after 3 attempts, dropping");
+            warn!(url = %url, "Webhook delivery failed after 3 attempts, dropping");
+        });
     }
 }
 
 /// A non-blocking handle to enqueue webhook events for an app.
 #[derive(Clone)]
 pub struct WebhookSender {
-    tx: mpsc::UnboundedSender<WebhookEvent>,
+    tx: mpsc::Sender<WebhookEvent>,
+    metrics: Arc<Metrics>,
 }
 
 impl WebhookSender {
     pub fn send(&self, event: WebhookEvent) {
-        let _ = self.tx.send(event);
+        if self.tx.try_send(event).is_err() {
+            self.metrics
+                .webhook_events_dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -188,13 +205,12 @@ pub struct WebhookManager {
 }
 
 impl WebhookManager {
-    pub fn new(apps: &[Arc<App>], client: reqwest::Client) -> Self {
+    pub fn new(apps: &[Arc<App>], client: reqwest::Client, metrics: Arc<Metrics>) -> Self {
         let mut senders = HashMap::new();
 
         for app in apps {
             if let Some(ref url) = app.webhook_url {
-                let (tx, rx) = mpsc::unbounded_channel();
-
+                let (tx, rx) = mpsc::channel(WEBHOOK_QUEUE_CAP);
                 let worker = WebhookWorker {
                     url: url.clone(),
                     key: app.key.clone(),
@@ -202,10 +218,17 @@ impl WebhookManager {
                     client: client.clone(),
                     rx,
                     batch_interval_ms: app.webhook_batch_ms,
+                    semaphore: Arc::new(Semaphore::new(WEBHOOK_DELIVER_PERMITS)),
                 };
 
                 tokio::spawn(worker.run());
-                senders.insert(app.id.clone(), WebhookSender { tx });
+                senders.insert(
+                    app.id.clone(),
+                    WebhookSender {
+                        tx,
+                        metrics: metrics.clone(),
+                    },
+                );
             }
         }
 
@@ -319,6 +342,26 @@ mod tests {
         assert_eq!(WEBHOOK_BATCH_MAX, 10);
     }
 
+    #[tokio::test]
+    async fn try_send_full_increments_drop_counter() {
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let (tx, _rx) = mpsc::channel(WEBHOOK_QUEUE_CAP);
+        let sender = WebhookSender {
+            tx,
+            metrics: metrics.clone(),
+        };
+        for _ in 0..WEBHOOK_QUEUE_CAP {
+            sender.send(WebhookEvent::channel_occupied("c"));
+        }
+        sender.send(WebhookEvent::channel_occupied("overflow"));
+        assert!(
+            metrics
+                .webhook_events_dropped
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1
+        );
+    }
+
     #[test]
     fn test_webhook_event_serialization() {
         let event = WebhookEvent::channel_occupied("test-channel");
@@ -404,8 +447,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_sender_non_blocking() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sender = WebhookSender { tx };
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let (tx, mut rx) = mpsc::channel(8);
+        let sender = WebhookSender { tx, metrics };
 
         sender.send(WebhookEvent::channel_occupied("ch1"));
         sender.send(WebhookEvent::channel_vacated("ch2"));
@@ -418,11 +462,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_sender_drop_on_closed_channel() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let sender = WebhookSender { tx };
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let (tx, rx) = mpsc::channel(8);
+        let sender = WebhookSender {
+            tx,
+            metrics: metrics.clone(),
+        };
         drop(rx);
 
-        // Should not panic — just silently drops
         sender.send(WebhookEvent::channel_occupied("ch1"));
+        assert_eq!(
+            metrics
+                .webhook_events_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 }

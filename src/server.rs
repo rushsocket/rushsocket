@@ -26,6 +26,7 @@ pub async fn build_app(config: Config) -> anyhow::Result<(Router, Arc<AppState>)
     let state = match config.adapter.as_str() {
         "local" => {
             info!("Using local adapter");
+            let metrics = Arc::new(crate::metrics::Metrics::new());
             let adapter = Arc::new(LocalAdapter::new());
             let cache: Arc<dyn CacheDriver> = Arc::new(MemoryCache::new());
             info!("Using memory cache");
@@ -34,12 +35,14 @@ pub async fn build_app(config: Config) -> anyhow::Result<(Router, Arc<AppState>)
                 app_manager,
                 adapter,
                 cache,
+                metrics,
             ))
         }
         "redis" => {
             info!("Using Redis adapter ({})", config.redis.url);
+            let metrics = Arc::new(crate::metrics::Metrics::new());
             let adapter = Arc::new(
-                RedisAdapter::new(&config.redis)
+                RedisAdapter::new(&config.redis, metrics.clone())
                     .await
                     .expect("Failed to connect to Redis"),
             );
@@ -54,6 +57,7 @@ pub async fn build_app(config: Config) -> anyhow::Result<(Router, Arc<AppState>)
                 app_manager,
                 adapter.clone(),
                 cache,
+                metrics,
             ))
         }
         other => {
@@ -359,6 +363,10 @@ async fn compute_stats(state: &Arc<AppState>) -> serde_json::Value {
         "process": process,
         "system": system,
         "apps": apps_detail,
+        "drops": {
+            "pubsub_broadcast": metrics.pubsub_broadcast_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            "webhook_events": metrics.webhook_events_dropped.load(std::sync::atomic::Ordering::Relaxed),
+        },
     })
 }
 

@@ -959,6 +959,84 @@ async fn redis_two_node_occupancy_webhook_once() {
     assert_eq!(drain_named(&events, "channel_occupied", "public-occ"), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_two_node_vacate_under_fanout() {
+    let Some((responder, requester)) = spawn_redis_pair().await else {
+        eprintln!("skipping redis_two_node_vacate_under_fanout");
+        return;
+    };
+
+    let mut r_clients = Vec::new();
+    for _ in 0..64 {
+        let mut c = Client::connect(&responder.ws).await;
+        c.subscribe_public("public-hol").await;
+        r_clients.push(c);
+    }
+    let mut q = Client::connect(&requester.ws).await;
+    q.subscribe_public("public-hol").await;
+
+    let flood_http = requester.http.clone();
+    let flood = tokio::spawn(async move {
+        let payload = "x".repeat(4096);
+        for _ in 0..30 {
+            let _ = trigger(&flood_http, "hol", "public-hol", &payload).await;
+        }
+    });
+
+    let incomplete_before = requester
+        .state
+        .metrics
+        .vacate_rpc_incomplete
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    q.ws.close(None).await.ok();
+
+    // Longer than redis_cluster_cfg request_timeout (1500ms) so a timeout would
+    // have incremented vacate_rpc_incomplete.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let occ_key = format!(
+        "{}:occupied:{}:public-hol",
+        responder.state.config.redis.prefix, APP_ID
+    );
+    let redis_occ = occupancy_key(&occ_key);
+    assert!(
+        redis_occ
+            .as_deref()
+            .is_some_and(|v| !v.is_empty() && v != "(nil)"),
+        "occupancy must remain while responder still has 64 sockets; redis_occ={redis_occ:?}"
+    );
+    assert_eq!(
+        requester
+            .state
+            .metrics
+            .vacate_rpc_incomplete
+            .load(std::sync::atomic::Ordering::Relaxed),
+        incomplete_before,
+        "requester last-leave RPC must complete under fan-out (received == expected)"
+    );
+    assert_eq!(r_clients.len(), 64);
+
+    let _ = flood.await;
+    for mut c in r_clients {
+        c.ws.close(None).await.ok();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let redis_occ = occupancy_key(&occ_key);
+        if redis_occ.as_deref() == Some("") || redis_occ.as_deref() == Some("(nil)") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "occupancy did not clear after last responder leave within 5s (not 15s TTL). redis_occ={redis_occ:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn occupancy_key(key: &str) -> Option<String> {
     std::process::Command::new("redis-cli")
         .args(["GET", key])

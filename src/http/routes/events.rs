@@ -135,6 +135,14 @@ pub async fn trigger(
     // Send to each channel and collect info if requested
     let data_value = serde_json::Value::String(req.data);
     let mut channels_info = serde_json::Map::new();
+    let counts = if want_subscription_count {
+        state
+            .adapter
+            .get_channel_socket_counts(&app_id, &channels)
+            .await
+    } else {
+        std::collections::HashMap::new()
+    };
 
     for channel in &channels {
         let msg = ServerMessage::channel_event(&req.name, channel, data_value.clone(), None);
@@ -164,10 +172,7 @@ pub async fn trigger(
         if want_info {
             let mut ch_info = serde_json::Map::new();
             if want_subscription_count {
-                let count = state
-                    .adapter
-                    .get_channel_socket_count(&app_id, channel)
-                    .await;
+                let count = counts.get(channel).copied().unwrap_or(0);
                 ch_info.insert("subscription_count".to_string(), serde_json::json!(count));
             }
             if want_user_count && kind.is_presence() {

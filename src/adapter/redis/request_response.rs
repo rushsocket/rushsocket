@@ -24,7 +24,9 @@ pub struct Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ResponsePayload {
-    Count(usize),
+    Count {
+        count: usize,
+    },
     /// Acknowledgement for DiscoverPeers requests.
     Ack,
 }

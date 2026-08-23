@@ -14,8 +14,8 @@ pub struct Namespace {
     pub sockets: DashMap<Arc<str>, Arc<WsConnection>>,
     /// Atomic connection counter for race-free admission control.
     connection_count: AtomicUsize,
-    /// channel -> set of socket_ids
-    pub channels: DashMap<String, HashSet<Arc<str>>>,
+    /// channel -> (socket_id -> connection)
+    pub channels: DashMap<String, HashMap<Arc<str>, Arc<WsConnection>>>,
     /// socket_id -> set of channels (reverse index for O(1) disconnect cleanup)
     socket_channels: DashMap<Arc<str>, HashSet<String>>,
     /// channel -> (user_id -> (user_info, set of socket_ids for this user))
@@ -105,16 +105,17 @@ impl Namespace {
     }
 
     /// Add a socket to a channel. Returns true if this is the first subscriber (channel occupied).
+    /// Returns false (and inserts nothing) if the socket is not registered.
     pub fn add_to_channel(&self, socket_id: &str, channel: &str) -> bool {
-        // Look up the Arc<str> from sockets to share the allocation
-        let sid_arc = match self.sockets.get(socket_id) {
-            Some(conn) => conn.socket_id.clone(),
-            None => Arc::from(socket_id),
+        let Some(conn) = self.sockets.get(socket_id) else {
+            return false;
         };
+        let sid_arc = conn.socket_id.clone();
+        let conn_arc = conn.clone();
+        drop(conn);
         let mut entry = self.channels.entry(channel.to_string()).or_default();
         let was_empty = entry.is_empty();
-        entry.insert(sid_arc.clone());
-        // Maintain reverse index
+        entry.insert(sid_arc.clone(), conn_arc);
         self.socket_channels
             .entry(sid_arc)
             .or_default()
@@ -137,19 +138,23 @@ impl Namespace {
     }
 
     pub fn send_to_channel(&self, channel: &str, message: Bytes, excepting_id: Option<&str>) {
-        if let Some(socket_ids) = self.channels.get(channel) {
-            for sid in socket_ids.iter() {
-                if Some(sid.as_ref()) == excepting_id {
-                    continue;
-                }
-                if let Some(conn) = self.sockets.get(sid.as_ref())
-                    && !conn.send_raw(message.clone())
-                {
-                    warn!(
-                        socket_id = sid.as_ref(),
-                        channel, "Slow consumer: outbound buffer full, connection will be closed"
-                    );
-                }
+        let recipients: Vec<Arc<WsConnection>> = {
+            let Some(members) = self.channels.get(channel) else {
+                return;
+            };
+            members
+                .iter()
+                .filter(|(sid, _)| Some(sid.as_ref()) != excepting_id)
+                .map(|(_, conn)| Arc::clone(conn))
+                .collect()
+        };
+        for conn in recipients {
+            let already_closing = conn.should_close();
+            if !conn.send_raw(message.clone()) && !already_closing {
+                warn!(
+                    socket_id = conn.socket_id.as_ref(),
+                    channel, "Slow consumer: outbound buffer full, connection will be closed"
+                );
             }
         }
     }
@@ -336,8 +341,17 @@ mod tests {
     }
 
     #[test]
+    fn add_to_channel_without_socket_is_false() {
+        let ns = Namespace::new();
+        assert!(!ns.add_to_channel("1.1", "my-channel"));
+        assert!(ns.get_channels().is_empty());
+        assert_eq!(ns.get_channel_socket_count("my-channel"), 0);
+    }
+
+    #[test]
     fn test_channel_join_leave() {
         let ns = Namespace::new();
+        ns.add_socket(make_conn("1.1"));
         let occupied = ns.add_to_channel("1.1", "my-channel");
         assert!(occupied); // first subscriber
         assert_eq!(ns.get_channel_socket_count("my-channel"), 1);
@@ -352,6 +366,8 @@ mod tests {
     #[test]
     fn test_channel_not_vacated_with_remaining() {
         let ns = Namespace::new();
+        ns.add_socket(make_conn("1.1"));
+        ns.add_socket(make_conn("2.2"));
         let occupied1 = ns.add_to_channel("1.1", "ch");
         let occupied2 = ns.add_to_channel("2.2", "ch");
         assert!(occupied1); // first subscriber
@@ -366,6 +382,8 @@ mod tests {
     #[test]
     fn last_leave_then_join_keeps_new_subscriber() {
         let ns = Namespace::new();
+        ns.add_socket(make_conn("1.1"));
+        ns.add_socket(make_conn("2.2"));
         ns.add_to_channel("1.1", "ch");
         assert!(ns.remove_from_channel("1.1", "ch"));
         ns.add_to_channel("2.2", "ch");
@@ -443,6 +461,8 @@ mod tests {
     #[test]
     fn concurrent_last_leave_does_not_drop_new_join() {
         let ns = Arc::new(Namespace::new());
+        ns.add_socket(make_conn("1.1"));
+        ns.add_socket(make_conn("2.2"));
         ns.add_to_channel("1.1", "ch");
         let leave = ns.clone();
         let join = ns.clone();
@@ -457,8 +477,8 @@ mod tests {
     #[test]
     fn concurrent_remove_socket_does_not_drop_new_join() {
         let ns = Arc::new(Namespace::new());
-        let conn = make_conn("1.1");
-        ns.add_socket(conn);
+        ns.add_socket(make_conn("1.1"));
+        ns.add_socket(make_conn("2.2"));
         ns.add_to_channel("1.1", "ch");
         let remove = ns.clone();
         let join = ns.clone();

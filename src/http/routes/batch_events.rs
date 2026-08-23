@@ -103,6 +103,28 @@ pub async fn trigger_batch(
     let mut batch_results = Vec::new();
     let mut has_any_info = false;
 
+    let sub_channels: Vec<String> = req
+        .batch
+        .iter()
+        .filter(|event| {
+            event
+                .info
+                .as_deref()
+                .or(global_info.as_deref())
+                .map(|s| s.split(',').any(|v| v.trim() == "subscription_count"))
+                .unwrap_or(false)
+        })
+        .map(|event| event.channel.clone())
+        .collect();
+    let counts = if sub_channels.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        state
+            .adapter
+            .get_channel_socket_counts(&app_id, &sub_channels)
+            .await
+    };
+
     for event in &req.batch {
         let data_value = serde_json::Value::String(event.data.clone());
         let msg = ServerMessage::channel_event(&event.name, &event.channel, data_value, None);
@@ -138,10 +160,7 @@ pub async fn trigger_batch(
             let want_usr = info_str.split(',').any(|v| v.trim() == "user_count");
             let mut ch_info = serde_json::Map::new();
             if want_sub {
-                let count = state
-                    .adapter
-                    .get_channel_socket_count(&app_id, &event.channel)
-                    .await;
+                let count = counts.get(&event.channel).copied().unwrap_or(0);
                 ch_info.insert("subscription_count".to_string(), serde_json::json!(count));
             }
             if want_usr && kind.is_presence() {
