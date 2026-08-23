@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
@@ -19,8 +19,6 @@ pub struct WsConnection {
     pub presence: Mutex<HashMap<String, (String, serde_json::Value)>>,
     /// Authenticated user info (from pusher:signin)
     pub user: Mutex<Option<UserInfo>>,
-    /// Whether the user has been authenticated (for user auth timeout)
-    pub user_authenticated: AtomicBool,
     /// Whether a server ping has been sent and we're waiting for pong
     pinged: AtomicBool,
     /// Set when the outbound channel is full (slow consumer); connection will be closed.
@@ -42,7 +40,6 @@ impl WsConnection {
             subscribed_channels: Mutex::new(HashSet::new()),
             presence: Mutex::new(HashMap::new()),
             user: Mutex::new(None),
-            user_authenticated: AtomicBool::new(false),
             pinged: AtomicBool::new(false),
             force_close: AtomicBool::new(false),
         }
@@ -102,12 +99,7 @@ impl WsConnection {
         self.subscribed_channels.lock().clone()
     }
 
-    pub fn set_presence(
-        &self,
-        channel: String,
-        user_id: String,
-        user_info: serde_json::Value,
-    ) {
+    pub fn set_presence(&self, channel: String, user_id: String, user_info: serde_json::Value) {
         self.presence.lock().insert(channel, (user_id, user_info));
     }
 

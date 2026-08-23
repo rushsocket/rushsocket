@@ -20,7 +20,15 @@ impl LocalAdapter {
             namespaces: DashMap::new(),
         }
     }
+}
 
+impl Default for LocalAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LocalAdapter {
     fn get_or_create_ns(&self, app_id: &str) -> Arc<Namespace> {
         self.namespaces
             .entry(app_id.to_string())
@@ -44,8 +52,17 @@ impl Adapter for LocalAdapter {
         self.get_or_create_ns(app_id).add_socket(conn);
     }
 
-    async fn try_add_socket(&self, app_id: &str, conn: Arc<WsConnection>, limit: i64) -> bool {
-        self.get_or_create_ns(app_id).try_add_socket(conn, limit)
+    async fn try_add_socket(
+        &self,
+        app_id: &str,
+        conn: Arc<WsConnection>,
+        limit: i64,
+    ) -> super::Admit {
+        if self.get_or_create_ns(app_id).try_add_socket(conn, limit) {
+            super::Admit::Ok
+        } else {
+            super::Admit::OverQuota
+        }
     }
 
     async fn remove_socket(&self, app_id: &str, socket_id: &str) -> Vec<String> {
@@ -140,6 +157,7 @@ impl Adapter for LocalAdapter {
             .add_presence_member(channel, socket_id, user_id, user_info)
     }
 
+    #[allow(clippy::result_unit_err)]
     async fn try_add_presence_member(
         &self,
         app_id: &str,
@@ -149,8 +167,13 @@ impl Adapter for LocalAdapter {
         user_info: &serde_json::Value,
         max_members: usize,
     ) -> Result<(bool, HashMap<String, serde_json::Value>), ()> {
-        self.get_or_create_ns(app_id)
-            .try_add_presence_member(channel, socket_id, user_id, user_info, max_members)
+        self.get_or_create_ns(app_id).try_add_presence_member(
+            channel,
+            socket_id,
+            user_id,
+            user_info,
+            max_members,
+        )
     }
 
     async fn remove_presence_member(
@@ -173,11 +196,7 @@ impl Adapter for LocalAdapter {
             .unwrap_or(0)
     }
 
-    async fn get_sockets_for_user(
-        &self,
-        app_id: &str,
-        user_id: &str,
-    ) -> Vec<Arc<WsConnection>> {
+    async fn get_sockets_for_user(&self, app_id: &str, user_id: &str) -> Vec<Arc<WsConnection>> {
         self.get_ns(app_id)
             .map(|ns| ns.get_sockets_for_user(user_id))
             .unwrap_or_default()
@@ -203,23 +222,9 @@ impl Adapter for LocalAdapter {
         }
     }
 
-    async fn get_socket(
-        &self,
-        app_id: &str,
-        socket_id: &str,
-    ) -> Option<Arc<WsConnection>> {
+    async fn get_socket(&self, app_id: &str, socket_id: &str) -> Option<Arc<WsConnection>> {
         self.get_ns(app_id)
             .and_then(|ns| ns.sockets.get(socket_id).map(|c| c.clone()))
-    }
-
-    async fn get_channel_sockets(&self, app_id: &str, channel: &str) -> Vec<String> {
-        self.get_ns(app_id)
-            .and_then(|ns| {
-                ns.channels
-                    .get(channel)
-                    .map(|s| s.iter().map(|sid| sid.to_string()).collect())
-            })
-            .unwrap_or_default()
     }
 
     async fn add_user(&self, app_id: &str, user_id: &str, socket_id: &str) {
@@ -230,5 +235,12 @@ impl Adapter for LocalAdapter {
         if let Some(ns) = self.get_ns(app_id) {
             ns.remove_user(user_id, socket_id);
         }
+    }
+
+    async fn local_sockets(&self) -> Vec<Arc<WsConnection>> {
+        self.namespaces
+            .iter()
+            .flat_map(|ns| ns.all_sockets())
+            .collect()
     }
 }

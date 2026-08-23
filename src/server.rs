@@ -1,8 +1,8 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{info, warn};
@@ -24,6 +24,18 @@ pub async fn build_app(config: Config) -> anyhow::Result<(Router, Arc<AppState>)
     let app_manager = Arc::new(StaticAppManager::new(config.apps.clone()));
 
     let state = match config.adapter.as_str() {
+        "local" => {
+            info!("Using local adapter");
+            let adapter = Arc::new(LocalAdapter::new());
+            let cache: Arc<dyn CacheDriver> = Arc::new(MemoryCache::new());
+            info!("Using memory cache");
+            Arc::new(AppState::new_with_cache(
+                config,
+                app_manager,
+                adapter,
+                cache,
+            ))
+        }
         "redis" => {
             info!("Using Redis adapter ({})", config.redis.url);
             let adapter = Arc::new(
@@ -33,20 +45,19 @@ pub async fn build_app(config: Config) -> anyhow::Result<(Router, Arc<AppState>)
             );
             adapter.start_listening().await;
             let cache: Arc<dyn CacheDriver> = Arc::new(
-                RedisCache::new(&config.redis.url)
+                RedisCache::new(&config.redis.url, &config.redis.prefix)
                     .expect("Failed to create Redis cache pool"),
             );
             info!("Using Redis cache");
-            let state = Arc::new(AppState::new_with_cache(config, app_manager, adapter.clone(), cache));
-            adapter.set_metrics(state.metrics.clone());
-            state
+            Arc::new(AppState::new_with_cache(
+                config,
+                app_manager,
+                adapter.clone(),
+                cache,
+            ))
         }
-        _ => {
-            info!("Using local adapter");
-            let adapter = Arc::new(LocalAdapter::new());
-            let cache: Arc<dyn CacheDriver> = Arc::new(MemoryCache::new());
-            info!("Using memory cache");
-            Arc::new(AppState::new_with_cache(config, app_manager, adapter, cache))
+        other => {
+            anyhow::bail!("unknown adapter '{other}'; expected local or redis");
         }
     };
 
@@ -68,7 +79,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let host: IpAddr = config.host.parse().map_err(|e| {
         anyhow::anyhow!(
             "Invalid host '{}': {}. Use an IP literal (e.g. 0.0.0.0, 127.0.0.1), not a hostname.",
-            config.host, e
+            config.host,
+            e
         )
     })?;
     let addr = SocketAddr::from((host, config.port));
@@ -79,6 +91,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let metrics_state = state.clone();
     let metrics_enabled = config.metrics_enabled;
     let metrics_port = config.metrics_port;
+    let metrics_host: IpAddr = config.metrics_host.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "Invalid metrics_host '{}': {}. Use an IP literal (e.g. 127.0.0.1), not a hostname.",
+            config.metrics_host,
+            e
+        )
+    })?;
 
     if metrics_enabled {
         // Spawn background task to compute stats every 2 seconds
@@ -100,7 +119,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             .route("/health", get(health_handler))
             .with_state(metrics_state);
 
-        let metrics_addr = SocketAddr::from((host, metrics_port));
+        let metrics_addr = SocketAddr::from((metrics_host, metrics_port));
         let metrics_listener = TcpListener::bind(metrics_addr).await?;
         info!("Stats server listening on {}", metrics_addr);
 
@@ -144,29 +163,54 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         wait_for_signal().await;
         info!("Shutdown signal received, starting graceful shutdown...");
 
-        // Phase 1: Stop accepting new WS connections
         shutdown_state.set_closing();
-        info!("Drain period: waiting {}s for WebSocket connections to drain", drain_period);
-        tokio::time::sleep(std::time::Duration::from_secs(drain_period)).await;
+        notify_stopping();
+        // Watch wake runs emit_closing (4200) on each connection; yield so the sink can flush
+        // before force_close is used as backup.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        for conn in shutdown_state.adapter.local_sockets().await {
+            conn.force_close();
+        }
+        info!(
+            "Drain period: waiting {}s for WebSocket connections to drain",
+            drain_period
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(drain_period);
+        while shutdown_state
+            .metrics
+            .connected
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
 
         // Phase 2: Stop accepting new HTTP connections, give in-flight requests grace_period
-        info!("Grace period: stopping HTTP server with {}s timeout", grace_period);
+        info!(
+            "Grace period: stopping HTTP server with {}s timeout",
+            grace_period
+        );
         shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(grace_period)));
     });
 
     if config.ssl.enabled {
-        let cert_path = config.ssl.cert_path.as_deref()
-            .expect("ssl.cert_path is required when ssl.enabled = true");
-        let key_path = config.ssl.key_path.as_deref()
-            .expect("ssl.key_path is required when ssl.enabled = true");
+        let cert_path =
+            config.ssl.cert_path.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("ssl.cert_path is required when ssl.enabled = true")
+            })?;
+        let key_path =
+            config.ssl.key_path.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("ssl.key_path is required when ssl.enabled = true")
+            })?;
 
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-            cert_path,
-            key_path,
-        )
-        .await?;
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
 
         info!("rushsocket listening on {} (TLS)", addr);
+        wait_until_ready(&state).await?;
         notify_ready();
 
         axum_server::bind_rustls(addr, tls_config)
@@ -175,6 +219,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             .await?;
     } else {
         info!("rushsocket listening on {}", addr);
+        wait_until_ready(&state).await?;
         notify_ready();
 
         axum_server::bind(addr)
@@ -231,7 +276,10 @@ async fn compute_stats(state: &Arc<AppState>) -> serde_json::Value {
         total_channels += channel_count;
 
         // Per-app metrics from atomic counters
-        let app_metrics = state.metrics.per_app.get(app_id)
+        let app_metrics = state
+            .metrics
+            .per_app
+            .get(app_id)
             .map(|m| m.to_json())
             .unwrap_or_else(|| serde_json::json!({}));
 
@@ -240,14 +288,21 @@ async fn compute_stats(state: &Arc<AppState>) -> serde_json::Value {
             _ => serde_json::Map::new(),
         };
         app_obj.insert("channels".to_string(), serde_json::json!(channel_count));
-        app_obj.insert("live_connections".to_string(), serde_json::json!(connection_count));
+        app_obj.insert(
+            "live_connections".to_string(),
+            serde_json::json!(connection_count),
+        );
 
         apps_detail.insert(app_id.clone(), serde_json::Value::Object(app_obj));
     }
 
     // Process + system info + memory % (blocking /proc reads offloaded from async runtime)
     let (process, system, memory_pct) = tokio::task::spawn_blocking(|| {
-        (read_process_info(), read_system_info(), crate::util::memory_usage_percent())
+        (
+            read_process_info(),
+            read_system_info(),
+            crate::util::memory_usage_percent(),
+        )
     })
     .await
     .unwrap_or_else(|_| (serde_json::json!({}), serde_json::json!({}), None));
@@ -259,10 +314,18 @@ async fn compute_stats(state: &Arc<AppState>) -> serde_json::Value {
 
     // Network totals from metrics
     let metrics = &state.metrics;
-    let ws_bytes_received = metrics.ws_bytes_received.load(std::sync::atomic::Ordering::Relaxed);
-    let ws_bytes_sent = metrics.ws_bytes_sent.load(std::sync::atomic::Ordering::Relaxed);
-    let http_bytes_received = metrics.http_bytes_received.load(std::sync::atomic::Ordering::Relaxed);
-    let http_bytes_sent = metrics.http_bytes_sent.load(std::sync::atomic::Ordering::Relaxed);
+    let ws_bytes_received = metrics
+        .ws_bytes_received
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let ws_bytes_sent = metrics
+        .ws_bytes_sent
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let http_bytes_received = metrics
+        .http_bytes_received
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let http_bytes_sent = metrics
+        .http_bytes_sent
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     serde_json::json!({
         "server": {
@@ -317,21 +380,32 @@ fn read_process_info() -> serde_json::Value {
             let map = info.as_object_mut().unwrap();
             for line in status.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 2 { continue; }
+                if parts.len() < 2 {
+                    continue;
+                }
                 match parts[0] {
                     "VmRSS:" => {
                         if let Ok(kb) = parts[1].parse::<u64>() {
-                            map.insert("memory_rss_bytes".to_string(), serde_json::json!(kb * 1024));
+                            map.insert(
+                                "memory_rss_bytes".to_string(),
+                                serde_json::json!(kb * 1024),
+                            );
                         }
                     }
                     "VmSize:" => {
                         if let Ok(kb) = parts[1].parse::<u64>() {
-                            map.insert("memory_virtual_bytes".to_string(), serde_json::json!(kb * 1024));
+                            map.insert(
+                                "memory_virtual_bytes".to_string(),
+                                serde_json::json!(kb * 1024),
+                            );
                         }
                     }
                     "VmPeak:" => {
                         if let Ok(kb) = parts[1].parse::<u64>() {
-                            map.insert("memory_peak_bytes".to_string(), serde_json::json!(kb * 1024));
+                            map.insert(
+                                "memory_peak_bytes".to_string(),
+                                serde_json::json!(kb * 1024),
+                            );
                         }
                     }
                     "Threads:" => {
@@ -346,7 +420,10 @@ fn read_process_info() -> serde_json::Value {
                     }
                     "nonvoluntary_ctxt_switches:" => {
                         if let Ok(n) = parts[1].parse::<u64>() {
-                            map.insert("nonvoluntary_ctx_switches".to_string(), serde_json::json!(n));
+                            map.insert(
+                                "nonvoluntary_ctx_switches".to_string(),
+                                serde_json::json!(n),
+                            );
                         }
                     }
                     _ => {}
@@ -367,15 +444,20 @@ fn read_process_info() -> serde_json::Value {
                 let ticks_per_sec = 100u64; // sysconf(_SC_CLK_TCK), almost always 100
                 let map = info.as_object_mut().unwrap();
                 if fields.len() > 12 {
-                    if let (Ok(utime), Ok(stime)) = (
-                        fields[11].parse::<u64>(),
-                        fields[12].parse::<u64>(),
-                    ) {
+                    if let (Ok(utime), Ok(stime)) =
+                        (fields[11].parse::<u64>(), fields[12].parse::<u64>())
+                    {
                         let cpu_user_ms = (utime * 1000) / ticks_per_sec;
                         let cpu_system_ms = (stime * 1000) / ticks_per_sec;
                         map.insert("cpu_user_ms".to_string(), serde_json::json!(cpu_user_ms));
-                        map.insert("cpu_system_ms".to_string(), serde_json::json!(cpu_system_ms));
-                        map.insert("cpu_total_ms".to_string(), serde_json::json!(cpu_user_ms + cpu_system_ms));
+                        map.insert(
+                            "cpu_system_ms".to_string(),
+                            serde_json::json!(cpu_system_ms),
+                        );
+                        map.insert(
+                            "cpu_total_ms".to_string(),
+                            serde_json::json!(cpu_user_ms + cpu_system_ms),
+                        );
                     }
                 }
                 // Open file descriptors: count /proc/self/fd entries
@@ -388,55 +470,37 @@ fn read_process_info() -> serde_json::Value {
         info
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        use std::mem;
+    #[cfg(not(target_os = "linux"))]
+    serde_json::json!({ "pid": pid })
+}
 
-        #[repr(C)]
-        #[allow(non_snake_case)]
-        struct ProcessMemoryCounters {
-            cb: u32,
-            PageFaultCount: u32,
-            PeakWorkingSetSize: usize,
-            WorkingSetSize: usize,
-            QuotaPeakPagedPoolUsage: usize,
-            QuotaPagedPoolUsage: usize,
-            QuotaPeakNonPagedPoolUsage: usize,
-            QuotaNonPagedPoolUsage: usize,
-            PagefileUsage: usize,
-            PeakPagefileUsage: usize,
-        }
+pub(crate) fn ready_wait_cap_ms(request_timeout_ms: u64) -> u64 {
+    std::cmp::max(
+        request_timeout_ms.saturating_mul(2),
+        request_timeout_ms.saturating_add(2000),
+    )
+}
 
-        extern "system" {
-            fn GetCurrentProcess() -> *mut std::ffi::c_void;
-            fn K32GetProcessMemoryInfo(
-                process: *mut std::ffi::c_void,
-                pmc: *mut ProcessMemoryCounters,
-                cb: u32,
-            ) -> i32;
-        }
-
-        let mut memory_rss: u64 = 0;
-        let mut memory_peak: u64 = 0;
-
-        unsafe {
-            let mut pmc: ProcessMemoryCounters = mem::zeroed();
-            pmc.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
-            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
-                memory_rss = pmc.WorkingSetSize as u64;
-                memory_peak = pmc.PeakWorkingSetSize as u64;
+async fn wait_until_ready(state: &AppState) -> anyhow::Result<()> {
+    if state.is_ready() {
+        return Ok(());
+    }
+    let cap_ms = ready_wait_cap_ms(state.config.redis.request_timeout);
+    let cap = std::time::Duration::from_millis(cap_ms);
+    let timed = tokio::time::timeout(cap, async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+        loop {
+            interval.tick().await;
+            if state.is_ready() {
+                return;
             }
         }
-
-        serde_json::json!({
-            "pid": pid,
-            "memory_rss_bytes": memory_rss,
-            "memory_peak_bytes": memory_peak,
-        })
+    })
+    .await;
+    if timed.is_err() || !state.is_ready() {
+        anyhow::bail!("adapter not ready after {cap_ms}ms");
     }
-
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    serde_json::json!({ "pid": pid })
+    Ok(())
 }
 
 /// Notify systemd that the service is ready (no-op on non-Linux).
@@ -448,6 +512,14 @@ fn notify_ready() {
 #[cfg(not(target_os = "linux"))]
 fn notify_ready() {}
 
+#[cfg(target_os = "linux")]
+fn notify_stopping() {
+    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Stopping]);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn notify_stopping() {}
+
 fn read_system_info() -> serde_json::Value {
     #[cfg(target_os = "linux")]
     {
@@ -455,7 +527,10 @@ fn read_system_info() -> serde_json::Value {
 
         // CPU count
         if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
-            let cores = cpuinfo.lines().filter(|l| l.starts_with("processor")).count();
+            let cores = cpuinfo
+                .lines()
+                .filter(|l| l.starts_with("processor"))
+                .count();
             info.insert("cpu_cores".to_string(), serde_json::json!(cores));
         }
 
@@ -479,16 +554,24 @@ fn read_system_info() -> serde_json::Value {
         if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
             for line in meminfo.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 2 { continue; }
+                if parts.len() < 2 {
+                    continue;
+                }
                 match parts[0] {
                     "MemTotal:" => {
                         if let Ok(kb) = parts[1].parse::<u64>() {
-                            info.insert("memory_total_bytes".to_string(), serde_json::json!(kb * 1024));
+                            info.insert(
+                                "memory_total_bytes".to_string(),
+                                serde_json::json!(kb * 1024),
+                            );
                         }
                     }
                     "MemAvailable:" => {
                         if let Ok(kb) = parts[1].parse::<u64>() {
-                            info.insert("memory_available_bytes".to_string(), serde_json::json!(kb * 1024));
+                            info.insert(
+                                "memory_available_bytes".to_string(),
+                                serde_json::json!(kb * 1024),
+                            );
                         }
                     }
                     _ => {}
@@ -510,4 +593,16 @@ fn read_system_info() -> serde_json::Value {
 
     #[cfg(not(target_os = "linux"))]
     serde_json::json!({})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ready_wait_cap_ms;
+
+    #[test]
+    fn ready_wait_cap_is_at_least_twice_request_timeout() {
+        assert_eq!(ready_wait_cap_ms(5000), 10000);
+        assert_eq!(ready_wait_cap_ms(1000), 3000);
+        assert_eq!(ready_wait_cap_ms(0), 2000);
+    }
 }

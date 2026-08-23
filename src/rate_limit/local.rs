@@ -25,7 +25,15 @@ impl LocalRateLimiter {
             read_limiters: DashMap::new(),
         }
     }
+}
 
+impl Default for LocalRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LocalRateLimiter {
     fn get_or_create(
         map: &DashMap<String, Arc<Limiter>>,
         key: &str,
@@ -37,7 +45,8 @@ impl LocalRateLimiter {
         let limiter = map
             .entry(key.to_string())
             .or_insert_with(|| {
-                let quota = Quota::per_second(NonZeroU32::new(max_per_sec as u32).unwrap());
+                let n = max_per_sec.clamp(1, u32::MAX as i64) as u32;
+                let quota = Quota::per_second(NonZeroU32::new(n).unwrap_or(NonZeroU32::MIN));
                 Arc::new(RateLimiter::direct(quota))
             })
             .clone();
@@ -77,6 +86,14 @@ impl LocalRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_i64_rate_limit_does_not_panic() {
+        let rl = LocalRateLimiter::new();
+        let _ = rl.check_backend_event("app1", 1i64 << 32);
+        let _ = rl.check_client_event("sock1", i64::MAX);
+        let _ = rl.check_read_request("app1", 1i64 << 33);
+    }
 
     #[test]
     fn test_unlimited_always_allows() {

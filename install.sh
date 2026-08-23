@@ -10,7 +10,24 @@ SERVICE_FILE="/etc/systemd/system/rushsocket.service"
 echo "=== rushsocket installer ==="
 echo ""
 
-# 1. Detect architecture
+# 1. Detect OS then architecture. Pre-built binaries are Linux-only.
+OS="$(uname -s)"
+if [ "$OS" = "Darwin" ]; then
+    echo "Error: pre-built binaries are Linux-only."
+    echo "On macOS, build from source:"
+    echo "  git clone https://github.com/${REPO}.git"
+    echo "  cd rushsocket && cargo build --release"
+    exit 1
+fi
+if [ "$OS" != "Linux" ]; then
+    echo "Error: unsupported OS: ${OS}"
+    echo "Supported platforms: Linux (pre-built) and macOS (build from source). Windows is not supported."
+    echo "Build from source:"
+    echo "  git clone https://github.com/${REPO}.git"
+    echo "  cd rushsocket && cargo build --release"
+    exit 1
+fi
+
 ARCH="$(uname -m)"
 case "$ARCH" in
     x86_64)  ASSET="rushsocket-linux-x86_64" ;;
@@ -58,20 +75,23 @@ install -m 755 "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 mkdir -p "$CONFIG_DIR"
 if [ ! -f "${CONFIG_DIR}/config.toml" ]; then
     echo "Installing default config to ${CONFIG_DIR}/config.toml..."
-    cat > "${CONFIG_DIR}/config.toml" << 'TOML'
-# rushsocket configuration
-# See https://github.com/rushsocket/rushsocket for the full reference.
+    GEN_SECRET="$(openssl rand -hex 16)"
+    GEN_KEY="$(openssl rand -hex 8)"
+    cat > "${CONFIG_DIR}/config.toml" << TOML
+# rushsocket configuration (Linux). macOS: cargo run; Windows is not supported.
+# Bind 0.0.0.0 only if you intend to listen on all interfaces.
 
-# host = "0.0.0.0"
-# port = 6001
+host = "127.0.0.1"
+port = 6001
+metrics_host = "127.0.0.1"
 
 [ssl]
 enabled = false
 
 [[apps]]
 id = "rushsocket-id"
-key = "rushsocket-key"
-secret = "rushsocket-secret"
+key = "${GEN_KEY}"
+secret = "${GEN_SECRET}"
 TOML
 else
     echo "Config already exists at ${CONFIG_DIR}/config.toml — skipping."
@@ -89,7 +109,9 @@ Type=notify
 ExecStart=/usr/local/bin/rushsocket --config /etc/rushsocket/config.toml
 Restart=always
 RestartSec=3
-TimeoutStopSec=15
+TimeoutStopSec=30
+# default request_timeout=5000ms → READY wait cap 10s; TimeoutStartSec = max(30, wait_cap_secs+10) = 30
+TimeoutStartSec=30
 LimitNOFILE=1000000
 TasksMax=infinity
 Nice=-10

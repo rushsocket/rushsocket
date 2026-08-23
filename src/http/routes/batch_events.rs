@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
 
 use crate::http::auth as http_auth;
@@ -35,47 +35,63 @@ pub async fn trigger_batch(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let app = match state.app_manager.find_by_id(&app_id) {
-        Some(a) => a,
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "App not found"}))),
-    };
-
-    let auth_signature = match params.get("auth_signature") {
-        Some(s) => s.clone(),
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Missing auth_signature"}))),
-    };
-
     let path = format!("/apps/{}/batch_events", app_id);
-    if !http_auth::verify_http_signature(&app.secret, "POST", &path, &params, &auth_signature) {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid signature"})));
-    }
-
-    // Verify body_md5 if provided
-    if let Some(expected_md5) = params.get("body_md5") {
-        let actual_md5 = http_auth::body_md5(&body);
-        if &actual_md5 != expected_md5 {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "body_md5 mismatch"})));
-        }
-    }
+    let app = match http_auth::authenticate_app(&state, &app_id, "POST", &path, &params, &body) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
 
     // Rate limit check
-    if !state.rate_limiter.check_backend_event(&app_id, app.max_backend_events_per_sec) {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "Rate limit exceeded"})));
+    if !state
+        .rate_limiter
+        .check_backend_event(&app_id, app.max_backend_events_per_sec)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "Rate limit exceeded"})),
+        );
     }
 
     let req: BatchRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid body: {}", e)}))),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid body: {}", e)})),
+            );
+        }
     };
 
     if req.batch.len() > app.max_event_batch_size {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Batch too large"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Batch too large"})),
+        );
     }
 
     // Per-event payload size check
     for event in &req.batch {
+        if event.name.len() > app.max_event_name_length {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Event name too long"})),
+            );
+        }
         if event.data.len() > app.max_event_payload_in_kb * 1024 {
-            return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"error": format!("The data content of this event exceeds the allowed maximum ({})", app.max_event_payload_in_kb * 1024)})));
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(
+                    serde_json::json!({"error": format!("The data content of this event exceeds the allowed maximum ({})", app.max_event_payload_in_kb * 1024)}),
+                ),
+            );
+        }
+        if !crate::protocol::channels::is_valid_channel_name(&event.channel)
+            || event.channel.len() > app.max_channel_name_length
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid channel name"})),
+            );
         }
     }
 
@@ -116,15 +132,23 @@ pub async fn trigger_batch(
         let info_param = event.info.as_deref().or(global_info.as_deref());
         if let Some(info_str) = info_param {
             has_any_info = true;
-            let want_sub = info_str.split(',').any(|v| v.trim() == "subscription_count");
+            let want_sub = info_str
+                .split(',')
+                .any(|v| v.trim() == "subscription_count");
             let want_usr = info_str.split(',').any(|v| v.trim() == "user_count");
             let mut ch_info = serde_json::Map::new();
             if want_sub {
-                let count = state.adapter.get_channel_socket_count(&app_id, &event.channel).await;
+                let count = state
+                    .adapter
+                    .get_channel_socket_count(&app_id, &event.channel)
+                    .await;
                 ch_info.insert("subscription_count".to_string(), serde_json::json!(count));
             }
             if want_usr && kind.is_presence() {
-                let count = state.adapter.get_presence_user_count(&app_id, &event.channel).await;
+                let count = state
+                    .adapter
+                    .get_presence_user_count(&app_id, &event.channel)
+                    .await;
                 ch_info.insert("user_count".to_string(), serde_json::json!(count));
             }
             batch_results.push(serde_json::Value::Object(ch_info));
@@ -134,7 +158,10 @@ pub async fn trigger_batch(
     }
 
     if has_any_info {
-        (StatusCode::OK, Json(serde_json::json!({"batch": batch_results})))
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"batch": batch_results})),
+        )
     } else {
         (StatusCode::OK, Json(serde_json::json!({})))
     }

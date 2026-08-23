@@ -9,7 +9,10 @@ use tracing_subscriber::EnvFilter;
 use rushsocket::config::Config;
 
 #[derive(Parser, Debug)]
-#[command(name = "rushsocket", about = "Pusher Protocol v7 compatible WebSocket server")]
+#[command(
+    name = "rushsocket",
+    about = "Pusher Protocol v7 compatible WebSocket server"
+)]
 struct Cli {
     /// Path to config file
     #[arg(short, long)]
@@ -37,9 +40,7 @@ async fn main() -> anyhow::Result<()> {
         EnvFilter::new("rushsocket=info")
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     info!(
         "Starting rushsocket v{} on {}:{}",
@@ -49,8 +50,16 @@ async fn main() -> anyhow::Result<()> {
     );
 
     if config.apps.is_empty() {
-        info!("No apps configured, using default app (key=app-key, secret=app-secret)");
+        if cli.config.is_some() {
+            eprintln!("Error: config file has no [[apps]] entries");
+            std::process::exit(1);
+        }
+        info!("No apps configured, using default app on loopback (secret not logged)");
         config.apps.push(rushsocket::config::AppConfig::default());
+    }
+    if let Err(e) = config.validate() {
+        eprintln!("Error: invalid config: {e}");
+        std::process::exit(1);
     }
 
     for app in &config.apps {

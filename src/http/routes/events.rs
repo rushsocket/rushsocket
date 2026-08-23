@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
 
 use crate::http::auth as http_auth;
@@ -33,73 +33,101 @@ pub async fn trigger(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> impl IntoResponse {
-    // Find app
-    let app = match state.app_manager.find_by_id(&app_id) {
-        Some(a) => a,
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "App not found"}))),
-    };
-
-    // Verify signature
-    let auth_signature = match params.get("auth_signature") {
-        Some(s) => s.clone(),
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Missing auth_signature"}))),
-    };
-
     let path = format!("/apps/{}/events", app_id);
-    if !http_auth::verify_http_signature(&app.secret, "POST", &path, &params, &auth_signature) {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid signature"})));
-    }
-
-    // Verify body_md5 if provided
-    if let Some(expected_md5) = params.get("body_md5") {
-        let actual_md5 = http_auth::body_md5(&body);
-        if &actual_md5 != expected_md5 {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "body_md5 mismatch"})));
-        }
-    }
+    let app = match http_auth::authenticate_app(&state, &app_id, "POST", &path, &params, &body) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
 
     // Rate limit check
-    if !state.rate_limiter.check_backend_event(&app_id, app.max_backend_events_per_sec) {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "Rate limit exceeded"})));
+    if !state
+        .rate_limiter
+        .check_backend_event(&app_id, app.max_backend_events_per_sec)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "Rate limit exceeded"})),
+        );
     }
 
     // Parse body
     let req: TriggerRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid body: {}", e)}))),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid body: {}", e)})),
+            );
+        }
     };
 
     // Determine channels
-    let channels: Vec<String> = if let Some(chs) = req.channels {
+    let mut channels: Vec<String> = if let Some(chs) = req.channels {
         chs
     } else if let Some(ch) = req.channel {
         vec![ch]
     } else {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "No channels specified"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "No channels specified"})),
+        );
     };
+    if channels.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Must have at least one channel"})),
+        );
+    }
+    {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        channels.retain(|c| seen.insert(c.clone()));
+    }
+    for channel in &channels {
+        if !crate::protocol::channels::is_valid_channel_name(channel)
+            || channel.len() > app.max_channel_name_length
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid channel name"})),
+            );
+        }
+    }
 
     // Validate
     if channels.len() > app.max_event_channels_at_once {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Too many channels"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Too many channels"})),
+        );
     }
 
     if req.name.len() > app.max_event_name_length {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Event name too long"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Event name too long"})),
+        );
     }
 
     if req.data.len() > app.max_event_payload_in_kb * 1024 {
-        return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"error": format!("The data content of this event exceeds the allowed maximum ({})", app.max_event_payload_in_kb * 1024)})));
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(
+                serde_json::json!({"error": format!("The data content of this event exceeds the allowed maximum ({})", app.max_event_payload_in_kb * 1024)}),
+            ),
+        );
     }
 
     state.metrics.on_http_call(body.len() as u64, 0);
 
     // Parse info parameter (from body or query string)
-    let info_str = req.info
-        .or_else(|| params.get("info").cloned());
-    let want_subscription_count = info_str.as_deref()
+    let info_str = req.info.or_else(|| params.get("info").cloned());
+    let want_subscription_count = info_str
+        .as_deref()
         .map(|s| s.split(',').any(|v| v.trim() == "subscription_count"))
         .unwrap_or(false);
-    let want_user_count = info_str.as_deref()
+    let want_user_count = info_str
+        .as_deref()
         .map(|s| s.split(',').any(|v| v.trim() == "user_count"))
         .unwrap_or(false);
     let want_info = want_subscription_count || want_user_count;
@@ -124,18 +152,29 @@ pub async fn trigger(
 
         state
             .adapter
-            .send_to_channel(&app_id, channel, bytes::Bytes::from(msg_json), req.socket_id.as_deref())
+            .send_to_channel(
+                &app_id,
+                channel,
+                bytes::Bytes::from(msg_json),
+                req.socket_id.as_deref(),
+            )
             .await;
 
         // Collect channel info if requested
         if want_info {
             let mut ch_info = serde_json::Map::new();
             if want_subscription_count {
-                let count = state.adapter.get_channel_socket_count(&app_id, channel).await;
+                let count = state
+                    .adapter
+                    .get_channel_socket_count(&app_id, channel)
+                    .await;
                 ch_info.insert("subscription_count".to_string(), serde_json::json!(count));
             }
             if want_user_count && kind.is_presence() {
-                let count = state.adapter.get_presence_user_count(&app_id, channel).await;
+                let count = state
+                    .adapter
+                    .get_presence_user_count(&app_id, channel)
+                    .await;
                 ch_info.insert("user_count".to_string(), serde_json::json!(count));
             }
             channels_info.insert(channel.clone(), serde_json::Value::Object(ch_info));
@@ -143,7 +182,10 @@ pub async fn trigger(
     }
 
     if !channels_info.is_empty() {
-        (StatusCode::OK, Json(serde_json::json!({"channels": channels_info})))
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"channels": channels_info})),
+        )
     } else {
         (StatusCode::OK, Json(serde_json::json!({})))
     }

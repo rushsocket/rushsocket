@@ -16,7 +16,15 @@ pub async fn handle(state: &Arc<AppState>, conn: &Arc<WsConnection>, msg: &Clien
             return;
         }
         "members" => true,
-        "all" | _ => false,
+        "all" => false,
+        other => {
+            tracing::warn!(mode = other, "unknown client_event_mode; treating as none");
+            conn.send(&ServerMessage::error(
+                "Client events are not enabled for this app",
+                Some(4301),
+            ));
+            return;
+        }
     };
 
     // Must have a channel
@@ -28,6 +36,15 @@ pub async fn handle(state: &Arc<AppState>, conn: &Arc<WsConnection>, msg: &Clien
         }
     };
 
+    let kind = ChannelKind::from_name(&channel);
+    if !kind.allows_client_events() {
+        conn.send(&ServerMessage::error(
+            "Client events are only allowed on private and presence channels",
+            Some(4009),
+        ));
+        return;
+    }
+
     // Must be subscribed to the channel
     if !conn.is_subscribed(&channel) {
         conn.send(&ServerMessage::error(
@@ -38,15 +55,12 @@ pub async fn handle(state: &Arc<AppState>, conn: &Arc<WsConnection>, msg: &Clien
     }
 
     // In "members" mode, only presence channel members can send client events
-    if is_members_only {
-        let kind = ChannelKind::from_name(&channel);
-        if !kind.is_presence() || conn.get_presence(&channel).is_none() {
-            conn.send(&ServerMessage::error(
-                "Client events require presence channel membership",
-                Some(4301),
-            ));
-            return;
-        }
+    if is_members_only && (!kind.is_presence() || conn.get_presence(&channel).is_none()) {
+        conn.send(&ServerMessage::error(
+            "Client events require presence channel membership",
+            Some(4301),
+        ));
+        return;
     }
 
     // Rate limit check
@@ -54,37 +68,19 @@ pub async fn handle(state: &Arc<AppState>, conn: &Arc<WsConnection>, msg: &Clien
         .rate_limiter
         .check_client_event(&conn.socket_id, conn.app.max_client_events_per_sec)
     {
-        conn.send(&ServerMessage::error(
-            "Rate limit exceeded",
-            Some(4301),
-        ));
-        return;
-    }
-
-    // Event name must start with "client-"
-    if !msg.event.starts_with("client-") {
-        conn.send(&ServerMessage::error(
-            "Client event must start with 'client-'",
-            Some(4009),
-        ));
+        conn.send(&ServerMessage::error("Rate limit exceeded", Some(4301)));
         return;
     }
 
     // Check event name length
     if msg.event.len() > conn.app.max_event_name_length {
-        conn.send(&ServerMessage::error(
-            "Event name too long",
-            Some(4009),
-        ));
+        conn.send(&ServerMessage::error("Event name too long", Some(4009)));
         return;
     }
 
     // Check payload size (estimate without allocating a full JSON string)
     if estimate_json_size(&msg.data) > conn.app.max_event_payload_in_kb * 1024 {
-        conn.send(&ServerMessage::error(
-            "Event payload too large",
-            Some(4009),
-        ));
+        conn.send(&ServerMessage::error("Event payload too large", Some(4009)));
         return;
     }
 

@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
-use tracing::{debug, info_span, Instrument};
+use tracing::{Instrument, debug, info_span};
 
 use crate::protocol::error_codes;
 use crate::protocol::messages::ServerMessage;
@@ -49,6 +49,10 @@ pub async fn ws_handler(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    if !state.is_ready() || state.is_closing() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
     let origin = headers
         .get("origin")
         .and_then(|v| v.to_str().ok())
@@ -58,6 +62,7 @@ pub async fn ws_handler(
         .write_buffer_size(4096)
         .max_write_buffer_size(65536)
         .on_upgrade(move |socket| handle_socket(socket, key, origin, state))
+        .into_response()
 }
 
 async fn handle_socket(
@@ -76,10 +81,7 @@ async fn handle_socket(
         Some(app) => app,
         None => {
             let (mut sink, _) = socket.split();
-            let err = ServerMessage::error(
-                "Could not find app",
-                Some(error_codes::UNKNOWN_APP),
-            );
+            let err = ServerMessage::error("Could not find app", Some(error_codes::UNKNOWN_APP));
             let _ = sink.send(Message::Text(err.to_json().into())).await;
             let _ = sink.close().await;
             return;
@@ -89,10 +91,7 @@ async fn handle_socket(
     // Check if app is enabled
     if !app.enabled {
         let (mut sink, _) = socket.split();
-        let err = ServerMessage::error(
-            "Application is disabled",
-            Some(error_codes::APP_DISABLED),
-        );
+        let err = ServerMessage::error("Application is disabled", Some(error_codes::APP_DISABLED));
         let _ = sink.send(Message::Text(err.to_json().into())).await;
         let _ = sink.close().await;
         return;
@@ -101,10 +100,7 @@ async fn handle_socket(
     // Validate origin
     if !validate_origin(origin.as_deref(), &app.allowed_origins) {
         let (mut sink, _) = socket.split();
-        let err = ServerMessage::error(
-            "Origin not allowed",
-            Some(4009),
-        );
+        let err = ServerMessage::error("Origin not allowed", Some(4009));
         let _ = sink.send(Message::Text(err.to_json().into())).await;
         let _ = sink.close().await;
         return;
@@ -117,10 +113,7 @@ async fn handle_socket(
         let usage = state.cached_memory_percent();
         if usage >= state.config.memory_threshold_percent {
             let (mut sink, _) = socket.split();
-            let err = ServerMessage::error(
-                "Memory usage too high",
-                Some(4009),
-            );
+            let err = ServerMessage::error("Memory usage too high", Some(4009));
             let _ = sink.send(Message::Text(err.to_json().into())).await;
             let _ = sink.close().await;
             return;
@@ -156,15 +149,32 @@ async fn run_connection(
     let conn = Arc::new(WsConnection::new(socket_id.clone(), app.clone(), tx));
 
     // Atomically check connection limit and register (no TOCTOU race)
-    if !state.adapter.try_add_socket(&app_id, conn.clone(), app.max_connections).await {
-        let (mut sink, _) = socket.split();
-        let err = ServerMessage::error(
-            "Over connection quota",
-            Some(error_codes::APP_OVER_CONNECTION_QUOTA),
-        );
-        let _ = sink.send(Message::Text(err.to_json().into())).await;
-        let _ = sink.close().await;
-        return;
+    match state
+        .adapter
+        .try_add_socket(&app_id, conn.clone(), app.max_connections)
+        .await
+    {
+        crate::adapter::Admit::Ok => {}
+        crate::adapter::Admit::OverQuota => {
+            let (mut sink, _) = socket.split();
+            let err = ServerMessage::error(
+                "Over connection quota",
+                Some(error_codes::APP_OVER_CONNECTION_QUOTA),
+            );
+            let _ = sink.send(Message::Text(err.to_json().into())).await;
+            let _ = sink.close().await;
+            return;
+        }
+        crate::adapter::Admit::Unavailable => {
+            let (mut sink, _) = socket.split();
+            let err = ServerMessage::error(
+                "Connection unavailable",
+                Some(error_codes::CONNECTION_UNAVAILABLE),
+            );
+            let _ = sink.send(Message::Text(err.to_json().into())).await;
+            let _ = sink.close().await;
+            return;
+        }
     }
     state.metrics.on_connect(&app_id);
 
@@ -172,10 +182,17 @@ async fn run_connection(
     let (mut sink, mut stream) = socket.split();
 
     // Send connection_established
-    let established = ServerMessage::connection_established(&socket_id, state.config.activity_timeout as u32);
+    let established =
+        ServerMessage::connection_established(&socket_id, state.config.activity_timeout as u32);
     let established_json = established.to_json();
-    state.metrics.on_ws_message_sent(&app_id, established_json.len() as u64);
-    if sink.send(Message::Text(established_json.into())).await.is_err() {
+    state
+        .metrics
+        .on_ws_message_sent(&app_id, established_json.len() as u64);
+    if sink
+        .send(Message::Text(established_json.into()))
+        .await
+        .is_err()
+    {
         state.adapter.remove_socket(&app_id, &socket_id).await;
         state.metrics.on_disconnect(&app_id);
         return;
@@ -197,18 +214,36 @@ async fn run_connection(
     let activity_deadline = tokio::time::sleep(std::time::Duration::from_secs(ping_interval_secs));
     tokio::pin!(activity_deadline);
 
+    let mut closing_rx = state.closing_rx.clone();
+
+    async fn emit_closing(sink: &mut (impl SinkExt<Message> + Unpin)) {
+        let err = ServerMessage::error("Server is closing", Some(error_codes::SERVER_CLOSING));
+        let _ = sink.send(Message::Text(err.to_json().into())).await;
+        let _ = sink.close().await;
+    }
+
     loop {
-        // Check if this connection was flagged as a slow consumer
+        if state.is_closing() {
+            emit_closing(&mut sink).await;
+            break;
+        }
         if conn.should_close() {
             break;
         }
 
         tokio::select! {
+            _ = async {
+                let _ = closing_rx.wait_for(|c| *c).await;
+            } => {
+                emit_closing(&mut sink).await;
+                break;
+            }
             result = stream.next() => {
                 match result {
                     Some(Ok(Message::Text(text))) => {
                         if text.len() > max_message_bytes {
-                            conn.send(&ServerMessage::error("Message too large", Some(4009)));
+                            let err = ServerMessage::error("Message too large", Some(4009));
+                            let _ = sink.send(Message::Text(err.to_json().into())).await;
                             break;
                         }
                         conn.clear_pinged();
@@ -218,7 +253,8 @@ async fn run_connection(
                     }
                     Some(Ok(Message::Binary(data))) => {
                         if data.len() > max_message_bytes {
-                            conn.send(&ServerMessage::error("Message too large", Some(4009)));
+                            let err = ServerMessage::error("Message too large", Some(4009));
+                            let _ = sink.send(Message::Text(err.to_json().into())).await;
                             break;
                         }
                         conn.clear_pinged();

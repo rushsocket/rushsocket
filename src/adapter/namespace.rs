@@ -35,7 +35,15 @@ impl Namespace {
             users: DashMap::new(),
         }
     }
+}
 
+impl Default for Namespace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Namespace {
     pub fn add_socket(&self, conn: Arc<WsConnection>) {
         let sid = conn.socket_id.clone();
         self.sockets.insert(sid, conn);
@@ -57,17 +65,20 @@ impl Namespace {
             if current >= max {
                 return false;
             }
-            if self.connection_count.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ).is_ok() {
+            if self
+                .connection_count
+                .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
                 let sid = conn.socket_id.clone();
                 self.sockets.insert(sid, conn);
                 return true;
             }
         }
+    }
+
+    pub fn all_sockets(&self) -> Vec<Arc<WsConnection>> {
+        self.sockets.iter().map(|e| e.value().clone()).collect()
     }
 
     pub fn remove_socket(&self, socket_id: &str) -> Vec<String> {
@@ -76,16 +87,16 @@ impl Namespace {
         }
         let mut vacated = Vec::new();
 
-        // Use reverse index to find only the channels this socket was in
         if let Some((_, channels)) = self.socket_channels.remove(socket_id) {
             for ch in channels {
-                let mut is_empty = false;
-                if let Some(mut sockets) = self.channels.get_mut(&ch) {
-                    sockets.remove(socket_id);
-                    is_empty = sockets.is_empty();
-                }
-                if is_empty {
-                    self.channels.remove(&ch);
+                if self
+                    .channels
+                    .remove_if_mut(&ch, |_, sockets| {
+                        sockets.remove(socket_id);
+                        sockets.is_empty()
+                    })
+                    .is_some()
+                {
                     vacated.push(ch);
                 }
             }
@@ -112,17 +123,13 @@ impl Namespace {
     }
 
     pub fn remove_from_channel(&self, socket_id: &str, channel: &str) -> bool {
-        let mut vacated = false;
-        if let Some(mut sockets) = self.channels.get_mut(channel) {
-            sockets.remove(socket_id);
-            if sockets.is_empty() {
-                vacated = true;
-            }
-        }
-        if vacated {
-            self.channels.remove(channel);
-        }
-        // Update reverse index
+        let vacated = self
+            .channels
+            .remove_if_mut(channel, |_, sockets| {
+                sockets.remove(socket_id);
+                sockets.is_empty()
+            })
+            .is_some();
         if let Some(mut chans) = self.socket_channels.get_mut(socket_id) {
             chans.remove(channel);
         }
@@ -135,14 +142,13 @@ impl Namespace {
                 if Some(sid.as_ref()) == excepting_id {
                     continue;
                 }
-                if let Some(conn) = self.sockets.get(sid.as_ref()) {
-                    if !conn.send_raw(message.clone()) {
-                        warn!(
-                            socket_id = sid.as_ref(),
-                            channel,
-                            "Slow consumer: outbound buffer full, connection will be closed"
-                        );
-                    }
+                if let Some(conn) = self.sockets.get(sid.as_ref())
+                    && !conn.send_raw(message.clone())
+                {
+                    warn!(
+                        socket_id = sid.as_ref(),
+                        channel, "Slow consumer: outbound buffer full, connection will be closed"
+                    );
                 }
             }
         }
@@ -157,16 +163,10 @@ impl Namespace {
     }
 
     pub fn get_channel_socket_count(&self, channel: &str) -> usize {
-        self.channels
-            .get(channel)
-            .map(|s| s.len())
-            .unwrap_or(0)
+        self.channels.get(channel).map(|s| s.len()).unwrap_or(0)
     }
 
-    pub fn get_presence_members(
-        &self,
-        channel: &str,
-    ) -> HashMap<String, serde_json::Value> {
+    pub fn get_presence_members(&self, channel: &str) -> HashMap<String, serde_json::Value> {
         self.presence
             .get(channel)
             .map(|members| {
@@ -185,10 +185,7 @@ impl Namespace {
         user_id: &str,
         user_info: &serde_json::Value,
     ) -> bool {
-        let mut channel_presence = self
-            .presence
-            .entry(channel.to_string())
-            .or_default();
+        let mut channel_presence = self.presence.entry(channel.to_string()).or_default();
         let is_new = !channel_presence.contains_key(user_id);
         channel_presence
             .entry(user_id.to_string())
@@ -207,6 +204,7 @@ impl Namespace {
     /// Returns `Ok((is_new, members))` on success, `Err(())` if over limit.
     /// Existing users are always allowed (additional sockets for the same user).
     /// The members snapshot is taken while still holding the entry guard, avoiding a second lookup.
+    #[allow(clippy::result_unit_err)]
     pub fn try_add_presence_member(
         &self,
         channel: &str,
@@ -215,10 +213,7 @@ impl Namespace {
         user_info: &serde_json::Value,
         max_members: usize,
     ) -> Result<(bool, HashMap<String, serde_json::Value>), ()> {
-        let mut channel_presence = self
-            .presence
-            .entry(channel.to_string())
-            .or_default();
+        let mut channel_presence = self.presence.entry(channel.to_string()).or_default();
         let already_present = channel_presence.contains_key(user_id);
         if !already_present && channel_presence.len() >= max_members {
             return Err(());
@@ -241,12 +236,7 @@ impl Namespace {
         Ok((!already_present, members))
     }
 
-    pub fn remove_presence_member(
-        &self,
-        channel: &str,
-        socket_id: &str,
-        user_id: &str,
-    ) -> bool {
+    pub fn remove_presence_member(&self, channel: &str, socket_id: &str, user_id: &str) -> bool {
         let mut user_gone = false;
         if let Some(mut channel_presence) = self.presence.get_mut(channel) {
             if let Some((_, sockets)) = channel_presence.get_mut(user_id) {
@@ -258,17 +248,14 @@ impl Namespace {
             }
             if channel_presence.is_empty() {
                 drop(channel_presence);
-                self.presence.remove(channel);
+                self.presence.remove_if(channel, |_, m| m.is_empty());
             }
         }
         user_gone
     }
 
     pub fn get_presence_user_count(&self, channel: &str) -> usize {
-        self.presence
-            .get(channel)
-            .map(|m| m.len())
-            .unwrap_or(0)
+        self.presence.get(channel).map(|m| m.len()).unwrap_or(0)
     }
 
     pub fn add_user(&self, user_id: &str, socket_id: &str) {
@@ -283,7 +270,7 @@ impl Namespace {
             sockets.remove(socket_id);
             if sockets.is_empty() {
                 drop(sockets);
-                self.users.remove(user_id);
+                self.users.remove_if(user_id, |_, s| s.is_empty());
             }
         }
     }
@@ -367,12 +354,21 @@ mod tests {
         let ns = Namespace::new();
         let occupied1 = ns.add_to_channel("1.1", "ch");
         let occupied2 = ns.add_to_channel("2.2", "ch");
-        assert!(occupied1);  // first subscriber
+        assert!(occupied1); // first subscriber
         assert!(!occupied2); // second subscriber, not newly occupied
         assert_eq!(ns.get_channel_socket_count("ch"), 2);
 
         let vacated = ns.remove_from_channel("1.1", "ch");
         assert!(!vacated);
+        assert_eq!(ns.get_channel_socket_count("ch"), 1);
+    }
+
+    #[test]
+    fn last_leave_then_join_keeps_new_subscriber() {
+        let ns = Namespace::new();
+        ns.add_to_channel("1.1", "ch");
+        assert!(ns.remove_from_channel("1.1", "ch"));
+        ns.add_to_channel("2.2", "ch");
         assert_eq!(ns.get_channel_socket_count("ch"), 1);
     }
 
@@ -442,5 +438,56 @@ mod tests {
         ns.remove_user("user1", "sock1");
         let sockets = ns.get_sockets_for_user("user1");
         assert!(sockets.is_empty());
+    }
+
+    #[test]
+    fn concurrent_last_leave_does_not_drop_new_join() {
+        let ns = Arc::new(Namespace::new());
+        ns.add_to_channel("1.1", "ch");
+        let leave = ns.clone();
+        let join = ns.clone();
+        let t1 = std::thread::spawn(move || leave.remove_from_channel("1.1", "ch"));
+        let t2 = std::thread::spawn(move || join.add_to_channel("2.2", "ch"));
+        t1.join().unwrap();
+        t2.join().unwrap();
+        assert_eq!(ns.get_channel_socket_count("ch"), 1);
+        assert!(ns.channels.get("ch").is_some());
+    }
+
+    #[test]
+    fn concurrent_remove_socket_does_not_drop_new_join() {
+        let ns = Arc::new(Namespace::new());
+        let conn = make_conn("1.1");
+        ns.add_socket(conn);
+        ns.add_to_channel("1.1", "ch");
+        let remove = ns.clone();
+        let join = ns.clone();
+        let t1 = std::thread::spawn(move || {
+            remove.remove_socket("1.1");
+        });
+        let t2 = std::thread::spawn(move || {
+            join.add_to_channel("2.2", "ch");
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        assert_eq!(ns.get_channel_socket_count("ch"), 1);
+    }
+
+    #[test]
+    fn concurrent_presence_last_leave_keeps_new_member() {
+        let ns = Arc::new(Namespace::new());
+        let info = serde_json::json!({});
+        ns.add_presence_member("ch", "sock1", "user1", &info);
+        let leave = ns.clone();
+        let join = ns.clone();
+        let t1 = std::thread::spawn(move || {
+            leave.remove_presence_member("ch", "sock1", "user1");
+        });
+        let t2 = std::thread::spawn(move || {
+            join.add_presence_member("ch", "sock2", "user2", &info);
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        assert_eq!(ns.get_presence_user_count("ch"), 1);
     }
 }

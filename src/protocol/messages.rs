@@ -40,20 +40,19 @@ impl ServerMessage {
         }
     }
 
-    pub fn pong() -> Self {
+    /// Per-channel subscribe failure. Official v7 does not define this server frame;
+    /// soketi-shaped `pusher:subscription_error` with double-encoded `{type,error,status}`.
+    pub fn subscription_error(channel: &str, message: &str, status: u16) -> Self {
+        let error_type = if status == 401 { "AuthError" } else { "Error" };
+        let inner = serde_json::json!({
+            "type": error_type,
+            "error": message,
+            "status": status,
+        });
         ServerMessage {
-            event: "pusher:pong".to_string(),
-            data: None,
-            channel: None,
-            user_id: None,
-        }
-    }
-
-    pub fn ping() -> Self {
-        ServerMessage {
-            event: "pusher:ping".to_string(),
-            data: None,
-            channel: None,
+            event: "pusher:subscription_error".to_string(),
+            data: Some(serde_json::Value::String(inner.to_string())),
+            channel: Some(channel.to_string()),
             user_id: None,
         }
     }
@@ -181,11 +180,23 @@ mod tests {
     }
 
     #[test]
-    fn test_pong() {
-        let msg = ServerMessage::pong();
-        assert_eq!(msg.event, "pusher:pong");
-        let json: serde_json::Value = serde_json::from_str(&msg.to_json()).unwrap();
+    fn test_pong_json_constant() {
+        let json: serde_json::Value = serde_json::from_str(PONG_JSON).unwrap();
+        assert_eq!(json["event"], "pusher:pong");
         assert!(json.get("data").is_none());
+    }
+
+    #[test]
+    fn test_subscription_error_double_serialized() {
+        let msg = ServerMessage::subscription_error("private-foo", "Authorization failed", 401);
+        let json: serde_json::Value = serde_json::from_str(&msg.to_json()).unwrap();
+        assert_eq!(json["event"], "pusher:subscription_error");
+        assert_eq!(json["channel"], "private-foo");
+        let data_str = json["data"].as_str().unwrap();
+        let inner: serde_json::Value = serde_json::from_str(data_str).unwrap();
+        assert_eq!(inner["type"], "AuthError");
+        assert_eq!(inner["error"], "Authorization failed");
+        assert_eq!(inner["status"], 401);
     }
 
     #[test]
@@ -236,7 +247,11 @@ mod tests {
 
     #[test]
     fn test_member_added() {
-        let msg = ServerMessage::member_added("presence-room", "user1", &serde_json::json!({"name": "Alice"}));
+        let msg = ServerMessage::member_added(
+            "presence-room",
+            "user1",
+            &serde_json::json!({"name": "Alice"}),
+        );
         let json: serde_json::Value = serde_json::from_str(&msg.to_json()).unwrap();
         assert_eq!(json["event"], "pusher_internal:member_added");
         assert_eq!(json["channel"], "presence-room");

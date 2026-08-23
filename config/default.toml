@@ -2,7 +2,9 @@
 # See README.md for the full configuration reference.
 
 # Bind address — must be an IP literal (e.g. "0.0.0.0", "127.0.0.1"), not a hostname.
-# host = "0.0.0.0"
+# Code default is 127.0.0.1 (loopback). Set 0.0.0.0 to listen publicly.
+# host = "127.0.0.1"
+# metrics_host = "127.0.0.1"
 # port = 6001
 
 # HTTP body size ceilings (KB). Applied at the transport layer before handlers run.

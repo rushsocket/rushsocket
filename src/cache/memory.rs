@@ -16,6 +16,8 @@ pub struct MemoryCache {
 }
 
 impl MemoryCache {
+    /// Spawns a Tokio cleanup task; not Default because that would require a runtime.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let store = Arc::new(DashMap::new());
         // Spawn a cleanup task
@@ -50,9 +52,5 @@ impl CacheDriver for MemoryCache {
                 expires_at: Instant::now() + Duration::from_secs(ttl_secs),
             },
         );
-    }
-
-    async fn forget(&self, key: &str) {
-        self.store.remove(key);
     }
 }

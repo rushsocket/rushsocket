@@ -6,8 +6,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Sign a message with HMAC-SHA256 and return hex-encoded signature.
 pub fn sign(secret: &str, message: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(message.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
@@ -34,8 +34,8 @@ pub fn verify_channel_auth(
     };
 
     // Streaming HMAC — no intermediate String allocation
-    let mut mac = HmacSha256::new_from_slice(app_secret.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(app_secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(socket_id.as_bytes());
     mac.update(b":");
     mac.update(channel.as_bytes());
@@ -65,8 +65,8 @@ pub fn verify_signin_auth(
         None => return false,
     };
 
-    let mut mac = HmacSha256::new_from_slice(app_secret.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(app_secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(socket_id.as_bytes());
     mac.update(b"::user::");
     mac.update(user_data.as_bytes());
@@ -75,18 +75,13 @@ pub fn verify_signin_auth(
 }
 
 /// Sign an HTTP API request using Pusher's signature scheme.
-pub fn sign_http_request(
-    secret: &str,
-    method: &str,
-    path: &str,
-    query_params: &str,
-) -> String {
+pub fn sign_http_request(secret: &str, method: &str, path: &str, query_params: &str) -> String {
     let string_to_sign = format!("{}\n{}\n{}", method, path, query_params);
     sign(secret, &string_to_sign)
 }
 
 /// Constant-time comparison.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -136,7 +131,9 @@ mod tests {
         let sig = sign(secret, &string_to_sign);
         let auth = format!("{}:{}", key, sig);
 
-        assert!(verify_channel_auth(key, secret, socket_id, channel, None, &auth));
+        assert!(verify_channel_auth(
+            key, secret, socket_id, channel, None, &auth
+        ));
     }
 
     #[test]
@@ -214,11 +211,18 @@ mod tests {
 
     #[test]
     fn test_sign_http_request() {
-        let sig = sign_http_request("secret", "POST", "/apps/123/events", "auth_key=key&auth_timestamp=1234");
+        let sig = sign_http_request(
+            "secret",
+            "POST",
+            "/apps/123/events",
+            "auth_key=key&auth_timestamp=1234",
+        );
         assert_eq!(sig.len(), 64);
         // Verify it matches signing the concatenated string
-        let expected = sign("secret", "POST\n/apps/123/events\nauth_key=key&auth_timestamp=1234");
+        let expected = sign(
+            "secret",
+            "POST\n/apps/123/events\nauth_key=key&auth_timestamp=1234",
+        );
         assert_eq!(sig, expected);
     }
-
 }

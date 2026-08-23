@@ -20,6 +20,8 @@ pub struct AppState {
     pub rate_limiter: Arc<LocalRateLimiter>,
     pub cache: Arc<dyn CacheDriver>,
     pub closing: AtomicBool,
+    pub closing_tx: watch::Sender<bool>,
+    pub closing_rx: watch::Receiver<bool>,
     pub started_at: Instant,
     /// Cached stats snapshot, updated by background task every 2 seconds.
     pub cached_stats: watch::Receiver<serde_json::Value>,
@@ -39,16 +41,23 @@ impl AppState {
         let (cached_stats_tx, cached_stats) = watch::channel(serde_json::json!({}));
 
         // Initialize webhook senders for apps that have webhook_url configured
-        let apps: Vec<Arc<crate::app::App>> = config.apps.iter()
+        let apps: Vec<Arc<crate::app::App>> = config
+            .apps
+            .iter()
             .map(|c| Arc::new(crate::app::App::from(c.clone())))
             .collect();
         let has_webhooks = apps.iter().any(|a| a.webhook_url.is_some());
         let webhooks = if has_webhooks {
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("webhook HTTP client");
             Some(WebhookManager::new(&apps, client))
         } else {
             None
         };
+
+        let (closing_tx, closing_rx) = watch::channel(false);
 
         Self {
             config,
@@ -58,6 +67,8 @@ impl AppState {
             rate_limiter: Arc::new(LocalRateLimiter::new()),
             cache,
             closing: AtomicBool::new(false),
+            closing_tx,
+            closing_rx,
             started_at: Instant::now(),
             cached_stats,
             cached_stats_tx,
@@ -76,7 +87,8 @@ impl AppState {
     }
 
     pub fn set_closing(&self) {
-        self.closing.store(true, Ordering::Relaxed);
+        self.closing.store(true, Ordering::SeqCst);
+        let _ = self.closing_tx.send(true);
     }
 
     /// Get the cached memory usage percentage (updated every 2s by stats timer).
@@ -86,6 +98,7 @@ impl AppState {
 
     /// Update the cached memory usage percentage.
     pub fn set_memory_percent(&self, pct: f64) {
-        self.memory_percent_bits.store(pct.to_bits(), Ordering::Relaxed);
+        self.memory_percent_bits
+            .store(pct.to_bits(), Ordering::Relaxed);
     }
 }

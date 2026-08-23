@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::app::App;
+
+/// Flush a webhook batch once it reaches this many events, even if the interval has not elapsed.
+pub const WEBHOOK_BATCH_MAX: usize = 10;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WebhookEvent {
@@ -43,42 +44,41 @@ struct WebhookWorker {
 impl WebhookWorker {
     async fn run(mut self) {
         let mut batch: Vec<WebhookEvent> = Vec::new();
-        let interval = tokio::time::Duration::from_millis(self.batch_interval_ms);
+        let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(
+            self.batch_interval_ms.max(1),
+        ));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
 
         loop {
-            // Drain as many events as possible, then flush on interval or channel close
-            let sleep = tokio::time::sleep(interval);
-            tokio::pin!(sleep);
-
-            loop {
-                tokio::select! {
-                    biased;
-                    event = self.rx.recv() => {
-                        match event {
-                            Some(e) => batch.push(e),
-                            None => {
-                                // Channel closed — flush remaining and exit
-                                if !batch.is_empty() {
-                                    self.flush(&mut batch).await;
-                                }
-                                return;
+            tokio::select! {
+                event = self.rx.recv() => {
+                    match event {
+                        Some(e) => {
+                            batch.push(e);
+                            if batch.len() >= WEBHOOK_BATCH_MAX {
+                                self.flush(&mut batch).await;
                             }
                         }
-                    }
-                    _ = &mut sleep => {
-                        break;
+                        None => {
+                            if !batch.is_empty() {
+                                self.flush(&mut batch).await;
+                            }
+                            return;
+                        }
                     }
                 }
-            }
-
-            if !batch.is_empty() {
-                self.flush(&mut batch).await;
+                _ = ticker.tick() => {
+                    if !batch.is_empty() {
+                        self.flush(&mut batch).await;
+                    }
+                }
             }
         }
     }
 
     async fn flush(&self, batch: &mut Vec<WebhookEvent>) {
-        let events: Vec<WebhookEvent> = batch.drain(..).collect();
+        let events: Vec<WebhookEvent> = std::mem::take(batch);
         let time_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -93,11 +93,7 @@ impl WebhookWorker {
             }
         };
 
-        // HMAC-SHA256 signature
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_bytes())
-            .expect("HMAC accepts any key length");
-        mac.update(body.as_bytes());
-        let signature = hex::encode(mac.finalize().into_bytes());
+        let signature = crate::auth::sign(&self.secret, &body);
 
         // Retry up to 3 times with exponential backoff
         for attempt in 0..3u32 {
@@ -119,6 +115,14 @@ impl WebhookWorker {
                 Ok(resp) if resp.status().is_success() => {
                     debug!(url = %self.url, events = payload.events.len(), "Webhook delivered");
                     return;
+                }
+                Ok(resp) if resp.status().is_redirection() => {
+                    warn!(
+                        url = %self.url,
+                        status = %resp.status(),
+                        attempt = attempt + 1,
+                        "Webhook redirect not followed"
+                    );
                 }
                 Ok(resp) => {
                     warn!(
@@ -170,7 +174,10 @@ pub async fn send_subscription_count(
         return;
     }
     if let Some(wh) = state.webhooks.as_ref().and_then(|w| w.get(app_id)) {
-        let count = state.adapter.get_channel_socket_count(app_id, channel).await;
+        let count = state
+            .adapter
+            .get_channel_socket_count(app_id, channel)
+            .await;
         wh.send(WebhookEvent::subscription_count(channel, count));
     }
 }
@@ -308,6 +315,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn webhook_batch_max_is_ten() {
+        assert_eq!(WEBHOOK_BATCH_MAX, 10);
+    }
+
+    #[test]
     fn test_webhook_event_serialization() {
         let event = WebhookEvent::channel_occupied("test-channel");
         let json = serde_json::to_value(&event).unwrap();
@@ -329,7 +341,13 @@ mod tests {
     #[test]
     fn test_client_event_serialization() {
         let data = serde_json::json!({"msg": "hello"});
-        let event = WebhookEvent::client_event("private-chat", "client-typing", &data, "sock-1", Some("user-1"));
+        let event = WebhookEvent::client_event(
+            "private-chat",
+            "client-typing",
+            &data,
+            "sock-1",
+            Some("user-1"),
+        );
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["name"], "client_event");
         assert_eq!(json["event"], "client-typing");
@@ -374,11 +392,10 @@ mod tests {
     #[test]
     fn test_hmac_signature() {
         let secret = "test-secret";
-        let body = r#"{"time_ms":1700000000000,"events":[{"name":"channel_occupied","channel":"ch1"}]}"#;
+        let body =
+            r#"{"time_ms":1700000000000,"events":[{"name":"channel_occupied","channel":"ch1"}]}"#;
 
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(body.as_bytes());
-        let sig = hex::encode(mac.finalize().into_bytes());
+        let sig = crate::auth::sign(secret, body);
 
         // Verify it's a valid hex-encoded SHA256 (64 chars)
         assert_eq!(sig.len(), 64);

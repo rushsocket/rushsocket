@@ -85,15 +85,27 @@ pub async fn handle(state: &Arc<AppState>, conn: &Arc<WsConnection>, msg: &Clien
         }
     };
 
-    let user_id_clone = user_id.clone();
-    *conn.user.lock() = Some(UserInfo {
-        id: user_id,
-        user_data: user_data.clone(),
-    });
-    conn.user_authenticated.store(true, std::sync::atomic::Ordering::Relaxed);
-
-    // Track user->socket mapping for terminate API
-    state.adapter.add_user(&conn.app.id, &user_id_clone, &conn.socket_id).await;
+    let previous = {
+        let mut guard = conn.user.lock();
+        let prev = guard.clone();
+        *guard = Some(UserInfo {
+            id: user_id.clone(),
+            user_data: user_data.clone(),
+        });
+        prev
+    };
+    if let Some(prev) = previous
+        && prev.id != user_id
+    {
+        state
+            .adapter
+            .remove_user(&conn.app.id, &prev.id, &conn.socket_id)
+            .await;
+    }
+    state
+        .adapter
+        .add_user(&conn.app.id, &user_id, &conn.socket_id)
+        .await;
 
     conn.send(&ServerMessage::signin_success(&user_data_str));
 }

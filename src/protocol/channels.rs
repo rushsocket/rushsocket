@@ -12,13 +12,27 @@ pub enum ChannelKind {
 
 impl ChannelKind {
     pub fn from_name(name: &str) -> Self {
+        // Pusher v7 cache forms (longest prefix first).
+        if name.starts_with("private-encrypted-cache-") {
+            return ChannelKind::CacheEncryptedPrivate;
+        }
+        if name.starts_with("presence-cache-") {
+            return ChannelKind::CachePresence;
+        }
+        if name.starts_with("private-cache-") {
+            return ChannelKind::CachePrivate;
+        }
+        // Legacy leading-`cache-` family (cache-private-*, cache-presence-*, cache-*).
         if let Some(rest) = name.strip_prefix("cache-") {
             return match Self::from_name_no_cache(rest) {
                 ChannelKind::Public => ChannelKind::CachePublic,
                 ChannelKind::Private => ChannelKind::CachePrivate,
                 ChannelKind::Presence => ChannelKind::CachePresence,
                 ChannelKind::EncryptedPrivate => ChannelKind::CacheEncryptedPrivate,
-                other => other, // shouldn't happen
+                ChannelKind::CachePublic
+                | ChannelKind::CachePrivate
+                | ChannelKind::CachePresence
+                | ChannelKind::CacheEncryptedPrivate => unreachable!(),
             };
         }
         Self::from_name_no_cache(name)
@@ -47,10 +61,7 @@ impl ChannelKind {
     }
 
     pub fn is_presence(self) -> bool {
-        matches!(
-            self,
-            ChannelKind::Presence | ChannelKind::CachePresence
-        )
+        matches!(self, ChannelKind::Presence | ChannelKind::CachePresence)
     }
 
     pub fn is_cache(self) -> bool {
@@ -66,6 +77,17 @@ impl ChannelKind {
     pub fn requires_auth(self) -> bool {
         self.is_private() || self.is_presence()
     }
+
+    /// Client events are allowed on private/presence (including cache variants), not public or encrypted.
+    pub fn allows_client_events(self) -> bool {
+        matches!(
+            self,
+            ChannelKind::Private
+                | ChannelKind::CachePrivate
+                | ChannelKind::Presence
+                | ChannelKind::CachePresence
+        )
+    }
 }
 
 pub fn is_valid_channel_name(name: &str) -> bool {
@@ -78,8 +100,7 @@ pub fn is_valid_channel_name(name: &str) -> bool {
         return false;
     }
     bytes[start..].iter().all(|&b| {
-        b.is_ascii_alphanumeric()
-            || matches!(b, b'-' | b'_' | b'=' | b'@' | b',' | b'.' | b';')
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'=' | b'@' | b',' | b'.' | b';')
     })
 }
 
@@ -100,7 +121,10 @@ mod tests {
 
     #[test]
     fn test_channel_kind_presence() {
-        assert_eq!(ChannelKind::from_name("presence-room"), ChannelKind::Presence);
+        assert_eq!(
+            ChannelKind::from_name("presence-room"),
+            ChannelKind::Presence
+        );
     }
 
     #[test]
@@ -113,13 +137,49 @@ mod tests {
 
     #[test]
     fn test_channel_kind_cache_variants() {
-        assert_eq!(ChannelKind::from_name("cache-my-channel"), ChannelKind::CachePublic);
-        assert_eq!(ChannelKind::from_name("cache-private-foo"), ChannelKind::CachePrivate);
-        assert_eq!(ChannelKind::from_name("cache-presence-room"), ChannelKind::CachePresence);
+        assert_eq!(
+            ChannelKind::from_name("cache-my-channel"),
+            ChannelKind::CachePublic
+        );
+        assert_eq!(
+            ChannelKind::from_name("cache-private-foo"),
+            ChannelKind::CachePrivate
+        );
+        assert_eq!(
+            ChannelKind::from_name("cache-presence-room"),
+            ChannelKind::CachePresence
+        );
         assert_eq!(
             ChannelKind::from_name("cache-private-encrypted-x"),
             ChannelKind::CacheEncryptedPrivate
         );
+        assert_eq!(
+            ChannelKind::from_name("private-cache-prices"),
+            ChannelKind::CachePrivate
+        );
+        assert_eq!(
+            ChannelKind::from_name("presence-cache-room"),
+            ChannelKind::CachePresence
+        );
+        assert_eq!(
+            ChannelKind::from_name("private-encrypted-cache-x"),
+            ChannelKind::CacheEncryptedPrivate
+        );
+        assert!(!ChannelKind::from_name("private-foo").is_cache());
+        assert!(ChannelKind::from_name("private-cache-prices").is_cache());
+        assert!(ChannelKind::from_name("cache-private-foo").is_cache());
+    }
+
+    #[test]
+    fn test_allows_client_events() {
+        assert!(ChannelKind::Private.allows_client_events());
+        assert!(ChannelKind::Presence.allows_client_events());
+        assert!(ChannelKind::CachePrivate.allows_client_events());
+        assert!(ChannelKind::CachePresence.allows_client_events());
+        assert!(!ChannelKind::Public.allows_client_events());
+        assert!(!ChannelKind::CachePublic.allows_client_events());
+        assert!(!ChannelKind::EncryptedPrivate.allows_client_events());
+        assert!(!ChannelKind::CacheEncryptedPrivate.allows_client_events());
     }
 
     #[test]

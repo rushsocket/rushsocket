@@ -3,10 +3,10 @@ pub mod routes;
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderName, StatusCode};
 use axum::routing::{get, post};
-use axum::Router;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -83,7 +83,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(api_routes)
         .layer(
             ServiceBuilder::new()
-                .layer(SetRequestIdLayer::new(x_request_id.clone(), MakeRequestUuid))
+                .layer(SetRequestIdLayer::new(
+                    x_request_id.clone(),
+                    MakeRequestUuid,
+                ))
                 .layer(PropagateRequestIdLayer::new(x_request_id))
                 .layer(CorsLayer::permissive()),
         )

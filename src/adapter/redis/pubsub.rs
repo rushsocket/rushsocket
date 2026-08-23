@@ -61,6 +61,13 @@ struct PendingState {
     expected_count: usize,
 }
 
+/// Cross-node RPC collection. `expected` is frozen at send time.
+#[derive(Debug, Clone)]
+pub struct RpcBatch {
+    pub expected: usize,
+    pub responses: Vec<ResponsePayload>,
+}
+
 pub struct RedisPubSub {
     /// Redis URL for creating connections.
     redis_url: String,
@@ -77,8 +84,6 @@ pub struct RedisPubSub {
     pending: DashMap<String, Arc<tokio::sync::Mutex<PendingState>>>,
     /// Node ID of this instance.
     node_id: String,
-    /// Last time any message was received on the subscriber (epoch secs).
-    last_received: AtomicU64,
     /// Known peer nodes: node_id -> last-seen instant (replaces PUBSUB NUMSUB).
     known_nodes: DashMap<String, std::time::Instant>,
     /// Whether subscriptions are live and peer discovery is complete.
@@ -87,13 +92,6 @@ pub struct RedisPubSub {
     /// Discovery tasks capture the current generation and only set subscribed = true
     /// if it still matches, preventing stale tasks from flipping readiness.
     generation: AtomicU64,
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 impl RedisPubSub {
@@ -110,7 +108,6 @@ impl RedisPubSub {
             request_timeout: Duration::from_millis(config.request_timeout),
             pending: DashMap::new(),
             node_id: node_id.to_string(),
-            last_received: AtomicU64::new(now_secs()),
             known_nodes: DashMap::new(),
             subscribed: AtomicBool::new(false),
             generation: AtomicU64::new(0),
@@ -142,7 +139,10 @@ impl RedisPubSub {
         let json = serde_json::to_string(&envelope).unwrap_or_default();
 
         let mut conn = self.broadcast_conn.lock().await;
-        match conn.publish::<_, _, ()>(&self.broadcast_channel(), &json).await {
+        match conn
+            .publish::<_, _, ()>(&self.broadcast_channel(), &json)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 warn!("Broadcast publish failed, attempting to reconnect: {}", e);
@@ -150,7 +150,8 @@ impl RedisPubSub {
                     Ok(client) => {
                         if let Ok(new_conn) = client.get_multiplexed_async_connection().await {
                             *conn = new_conn;
-                            conn.publish::<_, _, ()>(&self.broadcast_channel(), &json).await?;
+                            conn.publish::<_, _, ()>(&self.broadcast_channel(), &json)
+                                .await?;
                             info!("Broadcast publisher reconnected successfully");
                             Ok(())
                         } else {
@@ -164,17 +165,23 @@ impl RedisPubSub {
     }
 
     /// Send a request to all other nodes and collect responses.
+    /// `expected` is `get_peer_count()` at send time and is never zeroed on timeout.
+    /// Timeout and oneshot-cancel are incomplete `Ok` (partial responses kept).
+    /// Publish/reconnect failure is `Err`.
     pub async fn request(
         &self,
         sender_node: &str,
         request_type: RequestType,
-    ) -> Result<Vec<ResponsePayload>, redis::RedisError> {
+    ) -> Result<RpcBatch, redis::RedisError> {
         let request_id = uuid::Uuid::new_v4().to_string();
 
         // Get known peer count from node registry (no Redis round-trip)
         let expected_count = self.get_peer_count();
         if expected_count == 0 {
-            return Ok(vec![]);
+            return Ok(RpcBatch {
+                expected: 0,
+                responses: vec![],
+            });
         }
 
         let (tx, rx) = oneshot::channel();
@@ -201,24 +208,56 @@ impl RedisPubSub {
 
         {
             let mut conn = self.control_conn.lock().await;
-            conn.publish::<_, _, ()>(&self.request_channel(), &json)
-                .await?;
+            if let Err(e) = Self::publish_with_reconnect(
+                &mut conn,
+                &self.redis_url,
+                &self.request_channel(),
+                &json,
+            )
+            .await
+            {
+                self.pending.remove(&request_id);
+                return Err(e);
+            }
         }
 
         // Wait for responses with timeout
         let timeout = self.request_timeout;
         let result = tokio::time::timeout(timeout, rx).await;
 
-        // Clean up pending
-        self.pending.remove(&request_id);
-
         match result {
-            Ok(Ok(responses)) => Ok(responses),
-            Ok(Err(_)) => Ok(vec![]),
+            Ok(Ok(responses)) => {
+                self.pending.remove(&request_id);
+                Ok(RpcBatch {
+                    expected: expected_count,
+                    responses,
+                })
+            }
+            Ok(Err(_)) => {
+                let responses = self.take_pending_responses(&request_id).await;
+                Ok(RpcBatch {
+                    expected: expected_count,
+                    responses,
+                })
+            }
             Err(_) => {
                 debug!("Request {} timed out", request_id);
-                Ok(vec![])
+                let responses = self.take_pending_responses(&request_id).await;
+                Ok(RpcBatch {
+                    expected: expected_count,
+                    responses,
+                })
             }
+        }
+    }
+
+    async fn take_pending_responses(&self, request_id: &str) -> Vec<ResponsePayload> {
+        if let Some((_, state)) = self.pending.remove(request_id) {
+            let mut guard = state.lock().await;
+            guard.tx.take();
+            std::mem::take(&mut guard.responses)
+        } else {
+            vec![]
         }
     }
 
@@ -252,7 +291,8 @@ impl RedisPubSub {
         // Publish unconditionally — we don't know if peers exist yet
         let publish_result = {
             let mut conn = self.control_conn.lock().await;
-            conn.publish::<_, _, ()>(&self.request_channel(), &json).await
+            Self::publish_with_reconnect(&mut conn, &self.redis_url, &self.request_channel(), &json)
+                .await
         };
         if let Err(e) = publish_result {
             warn!("Failed to publish discover request: {}", e);
@@ -274,10 +314,10 @@ impl RedisPubSub {
             let state = state_ref.clone();
             let mut guard = state.lock().await;
             guard.responses.push(response.payload);
-            if guard.responses.len() >= guard.expected_count {
-                if let Some(tx) = guard.tx.take() {
-                    let _ = tx.send(guard.responses.clone());
-                }
+            if guard.responses.len() >= guard.expected_count
+                && let Some(tx) = guard.tx.take()
+            {
+                let _ = tx.send(guard.responses.clone());
             }
         }
     }
@@ -296,13 +336,40 @@ impl RedisPubSub {
         let json = serde_json::to_string(&envelope).unwrap_or_default();
 
         let mut conn = self.control_conn.lock().await;
-        conn.publish::<_, _, ()>(&response_channel, &json).await?;
-        Ok(())
+        Self::publish_with_reconnect(&mut conn, &self.redis_url, &response_channel, &json).await
+    }
+
+    async fn publish_with_reconnect(
+        conn: &mut redis::aio::MultiplexedConnection,
+        redis_url: &str,
+        channel: &str,
+        json: &str,
+    ) -> Result<(), redis::RedisError> {
+        match conn.publish::<_, _, ()>(channel, json).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!("Control publish failed, attempting to reconnect: {}", e);
+                match redis::Client::open(redis_url) {
+                    Ok(client) => {
+                        if let Ok(new_conn) = client.get_multiplexed_async_connection().await {
+                            *conn = new_conn;
+                            conn.publish::<_, _, ()>(channel, json).await?;
+                            info!("Control publisher reconnected successfully");
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
+                    }
+                    Err(_) => Err(e),
+                }
+            }
+        }
     }
 
     /// Record that a peer node is alive (called on any message from that node).
     fn record_peer(&self, node_id: &str) {
-        self.known_nodes.insert(node_id.to_string(), std::time::Instant::now());
+        self.known_nodes
+            .insert(node_id.to_string(), std::time::Instant::now());
     }
 
     /// Get the number of known live peer nodes (excluding self).
@@ -310,7 +377,8 @@ impl RedisPubSub {
     fn get_peer_count(&self) -> usize {
         let stale_threshold = Duration::from_secs(HEARTBEAT_INTERVAL * 2);
         let now = std::time::Instant::now();
-        self.known_nodes.retain(|_, last_seen| now.duration_since(*last_seen) < stale_threshold);
+        self.known_nodes
+            .retain(|_, last_seen| now.duration_since(*last_seen) < stale_threshold);
         self.known_nodes.len()
     }
 
@@ -323,7 +391,8 @@ impl RedisPubSub {
     pub fn get_known_node_ids(&self) -> Vec<String> {
         let stale_threshold = Duration::from_secs(HEARTBEAT_INTERVAL * 2);
         let now = std::time::Instant::now();
-        self.known_nodes.retain(|_, last_seen| now.duration_since(*last_seen) < stale_threshold);
+        self.known_nodes
+            .retain(|_, last_seen| now.duration_since(*last_seen) < stale_threshold);
         self.known_nodes.iter().map(|e| e.key().clone()).collect()
     }
 
@@ -346,8 +415,6 @@ impl RedisPubSub {
             // and skip setting subscribed = true.
             self.subscribed.store(false, Ordering::Relaxed);
             self.generation.fetch_add(1, Ordering::Relaxed);
-            // Reset last_received before each connection attempt
-            self.last_received.store(now_secs(), Ordering::Relaxed);
 
             match self
                 .subscribe_loop(&adapter, &broadcast_ch, &request_ch, &response_ch)
@@ -374,7 +441,10 @@ impl RedisPubSub {
         loop {
             tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL)).await;
 
-            if let Err(e) = self.publish(&self.node_id, &BroadcastMessage::Heartbeat).await {
+            if let Err(e) = self
+                .publish(&self.node_id, &BroadcastMessage::Heartbeat)
+                .await
+            {
                 warn!("Failed to send heartbeat: {}", e);
             } else {
                 debug!("Heartbeat sent");
@@ -403,7 +473,10 @@ impl RedisPubSub {
         // Announce ourselves now that subscriptions are live.
         // This ensures peers discover us and we can receive their requests.
         // Runs on every (re)connect so peers re-learn us after a reconnect too.
-        if let Err(e) = self.publish(&self.node_id, &BroadcastMessage::Heartbeat).await {
+        if let Err(e) = self
+            .publish(&self.node_id, &BroadcastMessage::Heartbeat)
+            .await
+        {
             warn!("Failed to send announce heartbeat: {}", e);
         }
 
@@ -421,7 +494,10 @@ impl RedisPubSub {
                 discover_self.subscribed.store(true, Ordering::Relaxed);
                 info!("Redis adapter ready (generation {})", generation);
             } else {
-                info!("Discovery result discarded (generation {} superseded)", generation);
+                info!(
+                    "Discovery result discarded (generation {} superseded)",
+                    generation
+                );
             }
         });
 
@@ -433,17 +509,12 @@ impl RedisPubSub {
             // Wait for next message OR timeout if nothing received for too long.
             // This catches silently dead connections that never error — they just
             // stop delivering messages.
-            let msg = tokio::time::timeout(
-                Duration::from_secs(SUBSCRIBER_TIMEOUT),
-                msg_stream.next(),
-            )
-            .await;
+            let msg =
+                tokio::time::timeout(Duration::from_secs(SUBSCRIBER_TIMEOUT), msg_stream.next())
+                    .await;
 
             match msg {
                 Ok(Some(msg)) => {
-                    // Got a message — record activity
-                    self.last_received.store(now_secs(), Ordering::Relaxed);
-
                     let payload: String = match msg.get_payload() {
                         Ok(p) => p,
                         Err(e) => {
@@ -451,6 +522,9 @@ impl RedisPubSub {
                             continue;
                         }
                     };
+                    if payload.is_empty() {
+                        continue;
+                    }
 
                     let envelope: PubSubEnvelope = match serde_json::from_str(&payload) {
                         Ok(e) => e,
@@ -485,8 +559,7 @@ impl RedisPubSub {
                                 responder_node: self.node_id.clone(),
                                 payload: response_payload,
                             };
-                            if let Err(e) =
-                                self.send_response(&request.sender_node, response).await
+                            if let Err(e) = self.send_response(&request.sender_node, response).await
                             {
                                 warn!("Failed to send response: {}", e);
                             }
@@ -509,7 +582,9 @@ impl RedisPubSub {
                         "No Redis pub/sub message received for {}s — connection likely dead, forcing reconnect",
                         SUBSCRIBER_TIMEOUT
                     );
-                    return Err("Subscriber timeout — no messages received, connection likely dead".into());
+                    return Err(
+                        "Subscriber timeout — no messages received, connection likely dead".into(),
+                    );
                 }
             }
         }

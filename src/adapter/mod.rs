@@ -18,6 +18,25 @@ pub struct ChannelInfo {
     pub user_count: Option<usize>,
 }
 
+/// Result of atomic connection admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admit {
+    Ok,
+    OverQuota,
+    Unavailable,
+}
+
+/// Map a quota EVAL outcome to admission. `Ok(true)` admitted, `Ok(false)` over quota.
+/// `Err` on an unlimited app (`limit < 0`) admits; `Err` on a finite limit is unavailable.
+pub fn map_quota_eval(limit: i64, eval: Result<bool, ()>) -> Admit {
+    match eval {
+        Ok(true) => Admit::Ok,
+        Ok(false) => Admit::OverQuota,
+        Err(()) if limit < 0 => Admit::Ok,
+        Err(()) => Admit::Unavailable,
+    }
+}
+
 /// The adapter trait abstracts single-node and multi-node storage.
 #[async_trait]
 pub trait Adapter: Send + Sync + 'static {
@@ -25,11 +44,10 @@ pub trait Adapter: Send + Sync + 'static {
     async fn add_socket(&self, app_id: &str, conn: Arc<WsConnection>);
 
     /// Atomically check the connection limit and add a socket.
-    /// Returns false (without inserting) if the limit would be exceeded.
-    /// A negative limit means unlimited.
-    async fn try_add_socket(&self, app_id: &str, conn: Arc<WsConnection>, _limit: i64) -> bool {
+    /// A negative limit means unlimited. Redis EVAL failure on a finite limit is `Unavailable`.
+    async fn try_add_socket(&self, app_id: &str, conn: Arc<WsConnection>, _limit: i64) -> Admit {
         self.add_socket(app_id, conn).await;
-        true
+        Admit::Ok
     }
 
     /// Remove a socket from an app namespace. Returns list of channels it was in.
@@ -82,6 +100,7 @@ pub trait Adapter: Send + Sync + 'static {
 
     /// Atomically check presence member limit, add a member, and return the current members.
     /// Returns `Ok((is_new, members))` on success, `Err(())` if over limit.
+    #[allow(clippy::result_unit_err)]
     async fn try_add_presence_member(
         &self,
         app_id: &str,
@@ -92,7 +111,9 @@ pub trait Adapter: Send + Sync + 'static {
         _max_members: usize,
     ) -> Result<(bool, HashMap<String, serde_json::Value>), ()> {
         // Default: no atomic check, just add and fetch members
-        let is_new = self.add_presence_member(app_id, channel, socket_id, user_id, user_info).await;
+        let is_new = self
+            .add_presence_member(app_id, channel, socket_id, user_id, user_info)
+            .await;
         let members = self.get_presence_members(app_id, channel).await;
         Ok((is_new, members))
     }
@@ -118,9 +139,6 @@ pub trait Adapter: Send + Sync + 'static {
     /// Get a socket by its ID.
     async fn get_socket(&self, app_id: &str, socket_id: &str) -> Option<Arc<WsConnection>>;
 
-    /// Get all socket IDs in a channel.
-    async fn get_channel_sockets(&self, app_id: &str, channel: &str) -> Vec<String>;
-
     /// Get local-only connection count (no cluster fan-out).
     async fn get_local_connection_count(&self, app_id: &str) -> usize {
         self.get_connection_count(app_id).await
@@ -131,21 +149,11 @@ pub trait Adapter: Send + Sync + 'static {
         self.get_channels(app_id).await
     }
 
-    /// Get local-only presence user count (no cluster fan-out).
-    async fn get_local_presence_user_count(&self, app_id: &str, channel: &str) -> usize {
-        self.get_presence_user_count(app_id, channel).await
-    }
-
     /// Track a user->socket mapping (for terminate API).
     async fn add_user(&self, _app_id: &str, _user_id: &str, _socket_id: &str) {}
 
     /// Remove a user->socket mapping (for terminate API cleanup).
     async fn remove_user(&self, _app_id: &str, _user_id: &str, _socket_id: &str) {}
-
-    /// Get aggregated metrics across all nodes. Default returns None (use local metrics).
-    async fn get_aggregated_metrics(&self) -> Option<serde_json::Value> {
-        None
-    }
 
     /// Check if a channel became globally occupied (first subscriber across all nodes).
     /// In local mode, `locally_occupied` is already globally correct.
@@ -176,5 +184,37 @@ pub trait Adapter: Send + Sync + 'static {
     /// are live and peer discovery is complete.
     fn is_ready(&self) -> bool {
         true
+    }
+
+    /// Snapshot of sockets on this node (for drain).
+    async fn local_sockets(&self) -> Vec<Arc<WsConnection>> {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_quota_eval_unlimited_eval_err_is_ok() {
+        assert_eq!(map_quota_eval(-1, Err(())), Admit::Ok);
+    }
+
+    #[test]
+    fn map_quota_eval_finite_eval_err_is_unavailable() {
+        assert_eq!(map_quota_eval(10, Err(())), Admit::Unavailable);
+    }
+
+    #[test]
+    fn map_quota_eval_over_quota() {
+        assert_eq!(map_quota_eval(10, Ok(false)), Admit::OverQuota);
+        assert_eq!(map_quota_eval(-1, Ok(false)), Admit::OverQuota);
+    }
+
+    #[test]
+    fn map_quota_eval_success() {
+        assert_eq!(map_quota_eval(10, Ok(true)), Admit::Ok);
+        assert_eq!(map_quota_eval(-1, Ok(true)), Admit::Ok);
     }
 }

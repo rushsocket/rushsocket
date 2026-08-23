@@ -90,7 +90,9 @@ To install a specific version:
 curl -sSfL https://raw.githubusercontent.com/rushsocket/rushsocket/main/install.sh | sudo bash -s -- v1.0.0
 ```
 
-Pre-built binaries are available for **x86_64** and **aarch64** Linux. No Rust toolchain required.
+Supported platforms: **Linux** and **macOS** only. Windows is not supported.
+
+Pre-built binaries are available for **x86_64** and **aarch64** Linux. No Rust toolchain required. `install.sh` refuses Darwin (and non-Linux) and prints a cargo-from-source recipe. On macOS, build from source (`cargo build --release` or `cargo run`).
 
 ### 🔨 Build from Source
 
@@ -135,7 +137,7 @@ The install script will:
 
 ## ⚙️ Configuration
 
-Running `rushsocket` without flags uses built-in defaults (app key: `rushsocket-key`, secret: `rushsocket-secret`). Use `--config` to load a custom config file.
+Running `rushsocket` without flags binds loopback (`127.0.0.1`) and injects a built-in default app (key `rushsocket-key`). The process log does not print the secret. `--config` with an empty `apps` list exits nonzero. Use `--config` to load a custom config file.
 
 ### 📋 Full Configuration Reference
 
@@ -148,8 +150,10 @@ Running `rushsocket` without flags uses built-in defaults (app key: `rushsocket-
 # Load with: rushsocket --config /path/to/config.toml
 
 # --- Server ---
-host = "0.0.0.0"                    # IP literal only (not a hostname)
+host = "127.0.0.1"                  # IP literal only (not a hostname). Use 0.0.0.0 to listen publicly.
 port = 6001
+metrics_host = "127.0.0.1"          # IP literal only. Hostnames like "localhost" fail load (do not inherit host).
+auth_timestamp_grace_secs = 600     # Max |now - auth_timestamp| for REST HMAC
 metrics_enabled = true
 metrics_port = 9100
 mode = "full"
@@ -204,7 +208,7 @@ allowed_origins = [                  # empty = allow all
 
 # Webhooks
 webhook_url = "https://example.com/webhooks"
-webhook_batch_ms = 1000              # Batching interval (ms)
+webhook_batch_ms = 1000              # Batching interval (ms), must be >= 1
 enable_subscription_count_webhook = false
 
 # Rate limits (per second, -1 = unlimited)
@@ -230,8 +234,9 @@ max_message_size_in_kb = 40
 
 | Option | Default | Description |
 |---|---|---|
-| `host` | `"0.0.0.0"` | Bind address (IP literal only, not a hostname) |
+| `host` | `"127.0.0.1"` | Bind address (IP literal only, not a hostname). Use `0.0.0.0` to listen on all interfaces. |
 | `port` | `6001` | WebSocket + HTTP API port |
+| `metrics_host` | `"127.0.0.1"` | Stats/health bind (IP literal only, independent of WS `host`). `"localhost"` fails load. |
 | `metrics_enabled` | `true` | Enable the stats/health server |
 | `metrics_port` | `9100` | Stats server port |
 | `mode` | `"full"` | Server mode |
@@ -244,17 +249,18 @@ max_message_size_in_kb = 40
 
 | Option | Default | Description |
 |---|---|---|
-| `activity_timeout` | `120` | Seconds before an idle connection is closed |
+| `activity_timeout` | `120` | Keepalive timeout advertised to clients in `pusher:connection_established` (not a server idle close) |
 | `server_ping_interval` | `60` | How often the server sends pings (seconds) |
 | `server_pong_timeout` | `15` | Seconds to wait for a pong before closing |
 | `shutdown_drain_period` | `10` | Seconds to wait for WS connections to drain after SIGTERM |
 | `shutdown_grace_period` | `6` | Hard timeout for in-flight HTTP requests after drain period |
+| `auth_timestamp_grace_secs` | `600` | Max `|now - auth_timestamp|` in seconds for REST HMAC |
 
 #### 🧠 Memory & Cache
 
 | Option | Default | Description |
 |---|---|---|
-| `memory_threshold_percent` | `90.0` | Reject new connections above this memory usage %. Sampled every 2s from `/proc` (Linux) or Win32 API (Windows), never blocking the connection handshake. |
+| `memory_threshold_percent` | `90.0` | Reject new connections above this memory usage %. Sampled every 2s from `/proc` on Linux. macOS: admission is a no-op (no `/proc`). Windows is not supported. |
 | `cache_ttl` | `3600` | Cache channel TTL in seconds |
 
 #### 🔧 Per-App Options
@@ -270,9 +276,9 @@ max_message_size_in_kb = 40
 | `enable_cache_channels` | `true` | Enable cache channel replay for new subscribers |
 | `allowed_origins` | `[]` | CORS origins — empty allows all |
 | `webhook_url` | — | URL to receive webhook POST requests |
-| `webhook_batch_ms` | `1000` | Webhook batching interval in milliseconds |
+| `webhook_batch_ms` | `1000` | Webhook batching interval in milliseconds (must be ≥ 1). Also flushes at 10 events. |
 | `enable_subscription_count_webhook` | `false` | Enable `subscription_count` webhook events |
-| `max_connections` | `-1` | Max concurrent connections per node (-1 = unlimited) |
+| `max_connections` | `-1` | Max concurrent connections (-1 = unlimited). Local adapter: this node. Redis adapter: cluster-wide HASH. |
 | `max_backend_events_per_sec` | `-1` | HTTP API event rate limit |
 | `max_client_events_per_sec` | `-1` | Client-to-server event rate limit |
 | `max_read_req_per_sec` | `-1` | HTTP GET request rate limit |
@@ -318,20 +324,22 @@ rushsocket exposes a Pusher-compatible HTTP REST API on the main port (`6001` by
 | `POST` | `/apps/{app_id}/events` | 📤 Trigger a single event |
 | `POST` | `/apps/{app_id}/batch_events` | 📦 Trigger multiple events in one request |
 | `GET` | `/apps/{app_id}/channels` | 📋 List all active channels |
-| `GET` | `/apps/{app_id}/channels/{channel}` | 🔍 Get channel info (subscriber count, etc.) |
+| `GET` | `/apps/{app_id}/channels/{channel}` | 🔍 Channel occupancy; counts only with `?info=` |
 | `GET` | `/apps/{app_id}/channels/{channel}/users` | 👥 List presence channel members |
 | `GET` | `/apps/{app_id}/connections` | 🔗 Get total connection count |
 | `POST` | `/apps/{app_id}/users/{user_id}/terminate_connections` | ⛔ Disconnect a user by ID |
+
+`GET /apps/{app_id}/channels/{channel}` returns `{"occupied": true|false}` unless you request attributes: `?info=subscription_count` and, for presence channels, `?info=user_count` (same opt-in as the list endpoint).
 
 ### 🔑 Authentication
 
 All requests must include query parameters: `auth_key`, `auth_timestamp`, `auth_version`, `auth_signature`, and `body_md5` (for POST requests with a body). The signature is computed as:
 
 ```
-HMAC-SHA256(secret, "METHOD\n/apps/{app_id}/endpoint\n{sorted_query_params}")
+HMAC-SHA256(secret, "METHOD\n/apps/{app_id}/endpoint\n{sorted_decoded_query_params}")
 ```
 
-POST requests with a `body_md5` query parameter are verified — if the MD5 hash of the request body does not match, the request is rejected with `400 Bad Request`.
+`sorted_decoded_query_params` is `k=v` joined with `&` over percent-**decoded** values (Pusher PHP/Python SDKs). A wire query of `filter_by_prefix=%40foo` is signed as `filter_by_prefix=@foo`. POST requests with a nonempty body require `body_md5`; GET and empty-body POST do not. `auth_timestamp` must be unix seconds with `|now - ts| <= auth_timestamp_grace_secs` (default 600) — both past and future skew. `auth_version` must be `1.0`. Disabled apps return `403`; unknown apps `404`; bad signatures `401`.
 
 ### 📤 Trigger an Event
 
@@ -355,9 +363,9 @@ rushsocket sends Pusher-compatible webhook notifications to your server when eve
 
 ### 📬 Delivery
 
-- 📦 Events are batched by the `webhook_batch_ms` interval (default: 1000ms) and sent as a single POST request
+- 📦 Events are batched by `webhook_batch_ms` (default 1000ms, must be ≥ 1) and flushed when the batch hits 10 events
 - 🔏 Each request is signed with HMAC-SHA256 using the app's secret
-- 🔁 Failed deliveries are retried up to 3 times with exponential backoff (2s, 4s, 8s)
+- 🔁 Failed deliveries are retried up to 3 attempts total with backoff (2s, then 4s). Redirects are not followed.
 - ⚡ Webhook delivery is non-blocking — it never slows down the WebSocket hot path
 
 ### 📋 Headers
@@ -388,7 +396,7 @@ rushsocket sends Pusher-compatible webhook notifications to your server when eve
 | `channel_occupied` | First subscriber joins a channel | `{"name": "channel_occupied", "channel": "my-channel"}` |
 | `channel_vacated` | Last subscriber leaves a channel | `{"name": "channel_vacated", "channel": "my-channel"}` |
 
-In Redis cluster mode, these are deduplicated globally — `channel_occupied` fires only once across all nodes (via Redis SETNX), and `channel_vacated` fires only when no node has any subscribers (verified with a real-time cross-node query).
+In Redis cluster mode, these are deduplicated globally (`SET NX EX 15`, refreshed from the 5s stats heartbeat). `channel_vacated` fires only when every known peer answers with zero subscribers — timeout or missing replies do **not** fire vacated. See [Distributed Occupancy](#-horizontal-scaling-with-redis).
 
 #### 💾 Cache Channel Events
 
@@ -517,10 +525,12 @@ rushsocket stores the following keys in Redis (all prefixed with the configured 
 
 | Key Pattern | Type | Purpose | TTL |
 |---|---|---|---|
-| `{prefix}:occupied:{app}:{channel}` | String | 🏠 Channel occupancy flag (SETNX for dedup) | None |
+| `{prefix}:occupied:{app}:{channel}` | String | 🏠 Channel occupancy flag (`SET NX EX`) | 15s (refreshed every 5s by every node with local subscribers) |
 | `{prefix}:presence:{app}:{channel}` | Hash | 👥 Presence members: `user_id` -> `user_info JSON` | None |
 | `{prefix}:psock:{app}:{channel}` | Hash | 🔢 Presence socket counts: `user_id` -> `count` | None |
+| `{prefix}:connections:{app}` | Hash | 🔗 Cluster connection quota: `node_id` -> local count (SET-absolute; reaped when `node_stats` expires) | None |
 | `{prefix}:node_stats:{node_id}` | String | 📊 Node stats JSON (connections, channels) | 15s |
+| `{prefix}:cache:{app}:{channel}` | String | 💾 Last cache-channel event (via RedisCache; prefix applied inside the driver) | `cache_ttl` |
 | `{prefix}#broadcast` | Pub/Sub | 📡 Channel messages, heartbeats | — |
 | `{prefix}#request` | Pub/Sub | 📨 Cross-node RPC requests | — |
 | `{prefix}#response:{node_id}` | Pub/Sub | 📩 Cross-node RPC responses | — |
@@ -531,7 +541,7 @@ rushsocket stores the following keys in Redis (all prefixed with the configured 
 
 **📊 Node Stats Heartbeats:** Every 5 seconds, each node writes its local stats (per-app connection counts and channel socket counts) to a Redis key with a 15-second TTL. Stats queries (`get_connection_count`, `get_channels`, `get_channel_socket_count`) read fresh local data plus cached remote data via `MGET` — no cross-node broadcasting needed. If a node crashes, its stats expire in 15 seconds.
 
-**🏠 Distributed Occupancy (SETNX/DEL):** `channel_occupied` and `channel_vacated` webhooks are deduplicated across the cluster. The first node to see a subscriber uses `SETNX` to claim the occupancy flag. The last node to see all subscribers leave verifies with a real-time cross-node query before deleting the flag and firing `channel_vacated`.
+**🏠 Distributed Occupancy (SET NX EX / DEL):** `channel_occupied` and `channel_vacated` webhooks are deduplicated across the cluster. The first node to see a subscriber uses `SET NX EX 15` to claim the occupancy flag. Every node with local subscribers refreshes `EXPIRE 15` from the 5s stats heartbeat. The last node to see all subscribers leave verifies with a complete peer count (timeout or missing replies do **not** fire vacated). If a vacate RPC times out, the key may expire after 15s and the next join can emit `channel_occupied` without a matching `channel_vacated`.
 
 ### ⚙️ Redis Adapter Behavior
 
@@ -539,7 +549,7 @@ rushsocket stores the following keys in Redis (all prefixed with the configured 
 - 💓 **Heartbeats:** Each node publishes a heartbeat every 30 seconds to keep connections alive and maintain the peer registry. Peers not seen for 60 seconds are pruned.
 - 🔄 **Reconnect handling:** If the Redis subscriber connection drops, the node marks itself not-ready, reconnects, resubscribes, and re-discovers peers before accepting traffic again. A generation counter prevents stale discovery tasks from incorrectly restoring readiness.
 - 🔀 **Connection splitting:** Broadcast traffic (channel messages, heartbeats) and control traffic (cross-node requests/responses) use separate Redis connections to prevent head-of-line blocking.
-- 📏 **Per-node quotas:** Connection limits and presence member limits are enforced per-node, not cluster-wide. This is consistent with the Pusher protocol and avoids cross-node coordination on the hot path.
+- 📏 **Cluster connection quota:** With the Redis adapter, `max_connections` is enforced cluster-wide via a per-app HASH (`HSET` this node's local count, sum `HVALS`). Fields for crashed nodes are reaped when their `node_stats` key expires. If Redis EVAL fails: unlimited apps (`max_connections = -1`) still admit; finite apps get `pusher:error` **4009** `"Connection unavailable"` (not 4004). Presence member limits remain live-node Lua (crash-ghosted members are not reaped). Local adapter quotas stay per-process.
 - ⏰ **Subscriber timeout:** If no message is received on the subscriber for 90 seconds (including heartbeats), the connection is assumed dead and a reconnect is forced.
 
 ---
@@ -637,7 +647,12 @@ rushsocket supports all Pusher channel types out of the box:
 | `private-` | 🔒 **Private** | Requires server-side authentication before subscribing |
 | `presence-` | 👥 **Presence** | Private + tracks who is subscribed with user info |
 | `private-encrypted-` | 🔐 **Encrypted Private** | End-to-end encrypted payload, server cannot read messages |
-| `cache-` | 💾 **Cache** | Replays the last event to new subscribers (combinable: `cache-private-`, `cache-presence-`) |
+| `cache-` | 💾 **Cache (public)** | Replays the last event to new subscribers |
+| `private-cache-` | 💾 **Cache + private** | Pusher v7 form. Legacy `cache-private-` is also accepted as a **different** channel name |
+| `presence-cache-` | 💾 **Cache + presence** | Pusher v7 form. Legacy `cache-presence-` is also accepted as a **different** channel name |
+| `private-encrypted-cache-` | 💾 **Cache + encrypted** | Pusher v7 form. Legacy `cache-private-encrypted-` is also accepted as a **different** channel name |
+
+HTTP `filter_by_prefix=presence-` matches Pusher `presence-cache-*` names. Legacy `cache-presence-*` does not match that prefix (the names are not aliases).
 
 ---
 
@@ -656,7 +671,7 @@ rushsocket supports all Pusher channel types out of the box:
 rushsocket uses an adapter pattern to abstract single-node vs. multi-node operation:
 
 - **Local adapter:** All state is in-memory using lock-free `DashMap` structures. Suitable for single-node deployments.
-- **Redis adapter:** Wraps the local adapter and adds Redis for cross-node coordination. Channel messages are broadcast via pub/sub. Presence state is stored in Redis Hashes. Stats are exchanged via periodic heartbeat keys with TTL. A request/response protocol handles cluster-wide queries that can't be served from Redis alone (e.g., listing socket IDs in a channel, aggregating metrics).
+- **Redis adapter:** Wraps the local adapter and adds Redis for cross-node coordination. Channel messages are broadcast via pub/sub. Presence state is stored in Redis Hashes. Stats are exchanged via periodic heartbeat keys with TTL. A request/response protocol is used for real-time vacate completeness checks.
 
 ### 🧠 Key Design Decisions
 
@@ -703,7 +718,7 @@ src/
 │   └── events/      #   Event handlers (subscribe, unsubscribe, signin, client events, ping/pong)
 ├── server.rs        # 🚀 Server orchestration, startup, sd-notify, stats computation
 ├── state.rs         # 🏗️ Shared application state
-├── util.rs          # 🧠 Memory usage sampling (Linux /proc, Windows Win32)
+├── util.rs          # 🧠 Memory usage sampling (Linux /proc; macOS no-op)
 ├── lib.rs           # 📦 Module exports
 └── main.rs          # 🏁 CLI entry point
 ```

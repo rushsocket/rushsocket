@@ -35,22 +35,27 @@ pub async fn handle(state: &Arc<AppState>, conn: &Arc<WsConnection>, msg: &Clien
     let kind = ChannelKind::from_name(&channel);
 
     // Handle presence member removal
-    if kind.is_presence() {
-        if let Some((user_id, _)) = conn.remove_presence(&channel) {
-            let user_gone = state
+    if kind.is_presence()
+        && let Some((user_id, _)) = conn.remove_presence(&channel)
+    {
+        let user_gone = state
+            .adapter
+            .remove_presence_member(app_id, &channel, &conn.socket_id, &user_id)
+            .await;
+        if user_gone {
+            let removed = ServerMessage::member_removed(&channel, &user_id);
+            state
                 .adapter
-                .remove_presence_member(app_id, &channel, &conn.socket_id, &user_id)
+                .send_to_channel(
+                    app_id,
+                    &channel,
+                    bytes::Bytes::from(removed.to_json()),
+                    Some(&conn.socket_id),
+                )
                 .await;
-            if user_gone {
-                let removed = ServerMessage::member_removed(&channel, &user_id);
-                state
-                    .adapter
-                    .send_to_channel(app_id, &channel, bytes::Bytes::from(removed.to_json()), Some(&conn.socket_id))
-                    .await;
 
-                if let Some(wh) = state.webhooks.as_ref().and_then(|w| w.get(app_id)) {
-                    wh.send(WebhookEvent::member_removed(&channel, &user_id));
-                }
+            if let Some(wh) = state.webhooks.as_ref().and_then(|w| w.get(app_id)) {
+                wh.send(WebhookEvent::member_removed(&channel, &user_id));
             }
         }
     }
@@ -61,10 +66,13 @@ pub async fn handle(state: &Arc<AppState>, conn: &Arc<WsConnection>, msg: &Clien
         .remove_from_channel(app_id, &conn.socket_id, &channel)
         .await;
 
-    if state.adapter.is_channel_globally_vacated(app_id, &channel, vacated).await {
-        if let Some(wh) = state.webhooks.as_ref().and_then(|w| w.get(app_id)) {
-            wh.send(WebhookEvent::channel_vacated(&channel));
-        }
+    if state
+        .adapter
+        .is_channel_globally_vacated(app_id, &channel, vacated)
+        .await
+        && let Some(wh) = state.webhooks.as_ref().and_then(|w| w.get(app_id))
+    {
+        wh.send(WebhookEvent::channel_vacated(&channel));
     }
 
     crate::webhook::send_subscription_count(

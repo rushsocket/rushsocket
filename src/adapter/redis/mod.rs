@@ -1,3 +1,4 @@
+pub mod lua;
 pub mod pubsub;
 pub mod request_response;
 
@@ -6,11 +7,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use dashmap::DashMap;
 use redis::AsyncCommands;
 use tracing::{error, warn};
 
+use lua::{PRESENCE_ADD_LUA, PRESENCE_REMOVE_LUA, QUOTA_LUA};
+
 use super::local::LocalAdapter;
-use super::{Adapter, ChannelInfo};
+use super::{Adapter, Admit, ChannelInfo, map_quota_eval};
+
+const OCCUPANCY_TTL_SECS: i64 = 15;
+
+/// Vacated iff no known peers, or every expected peer answered and the count sum is 0.
+pub(crate) fn vacated_from_peer_rpc(expected: usize, received: usize, remote_sum: usize) -> bool {
+    expected == 0 || (received == expected && remote_sum == 0)
+}
 use crate::config::RedisConfig;
 use crate::protocol::channels::ChannelKind;
 use crate::websocket::connection::WsConnection;
@@ -24,7 +35,8 @@ pub struct RedisAdapter {
     node_id: String,
     prefix: String,
     cmd_conn: tokio::sync::Mutex<redis::aio::MultiplexedConnection>,
-    metrics: std::sync::OnceLock<Arc<crate::metrics::Metrics>>,
+    /// Serialize same-node quota admits/removes per app (snapshot → Lua → local).
+    quota_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl RedisAdapter {
@@ -40,8 +52,89 @@ impl RedisAdapter {
             node_id,
             prefix: config.prefix.clone(),
             cmd_conn: tokio::sync::Mutex::new(cmd_conn),
-            metrics: std::sync::OnceLock::new(),
+            quota_locks: DashMap::new(),
         })
+    }
+
+    fn connections_key(&self, app_id: &str) -> String {
+        format!("{}:connections:{}", self.prefix, app_id)
+    }
+
+    fn quota_lock(&self, app_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.quota_locks
+            .entry(app_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Caller must hold `quota_lock(app_id)` when `set_count` is `Some` (SET path).
+    async fn quota_eval(
+        &self,
+        app_id: &str,
+        set_count: Option<i64>,
+        limit: i64,
+    ) -> Result<(bool, i64), redis::RedisError> {
+        let key = self.connections_key(app_id);
+        let stats_prefix = format!("{}:node_stats:", self.prefix);
+        let mode = if set_count.is_some() { 1i64 } else { 0 };
+        let new_count = set_count.unwrap_or(0);
+        let mut conn = self.cmd_conn.lock().await;
+        let result: Vec<i64> = redis::cmd("EVAL")
+            .arg(QUOTA_LUA)
+            .arg(1)
+            .arg(&key)
+            .arg(&self.node_id)
+            .arg(new_count)
+            .arg(limit)
+            .arg(mode)
+            .arg(&stats_prefix)
+            .query_async(&mut *conn)
+            .await?;
+        let ok = result.first().copied().unwrap_or(0) == 1;
+        let sum = result.get(1).copied().unwrap_or(0);
+        Ok((ok, sum))
+    }
+
+    async fn presence_add_eval(
+        &self,
+        presence_key: &str,
+        psock_key: &str,
+        user_id: &str,
+        info_json: &str,
+        max_members: i64,
+    ) -> Result<(bool, bool), redis::RedisError> {
+        let mut conn = self.cmd_conn.lock().await;
+        let result: Vec<i64> = redis::cmd("EVAL")
+            .arg(PRESENCE_ADD_LUA)
+            .arg(2)
+            .arg(presence_key)
+            .arg(psock_key)
+            .arg(user_id)
+            .arg(info_json)
+            .arg(max_members)
+            .query_async(&mut *conn)
+            .await?;
+        let accepted = result.first().copied().unwrap_or(0) == 1;
+        let is_new = result.get(1).copied().unwrap_or(0) == 1;
+        Ok((accepted, is_new))
+    }
+
+    async fn presence_remove_eval(
+        &self,
+        presence_key: &str,
+        psock_key: &str,
+        user_id: &str,
+    ) -> Result<bool, redis::RedisError> {
+        let mut conn = self.cmd_conn.lock().await;
+        let gone: i64 = redis::cmd("EVAL")
+            .arg(PRESENCE_REMOVE_LUA)
+            .arg(2)
+            .arg(presence_key)
+            .arg(psock_key)
+            .arg(user_id)
+            .query_async(&mut *conn)
+            .await?;
+        Ok(gone == 1)
     }
 
     fn occupancy_key(&self, app_id: &str, channel: &str) -> String {
@@ -60,39 +153,6 @@ impl RedisAdapter {
         format!("{}:node_stats:{}", self.prefix, node_id)
     }
 
-    pub fn node_id(&self) -> &str {
-        &self.node_id
-    }
-
-    /// Set the metrics reference (called after AppState creation).
-    pub fn set_metrics(&self, metrics: Arc<crate::metrics::Metrics>) {
-        let _ = self.metrics.set(metrics);
-    }
-
-    /// Get aggregated metrics from all nodes (local + remote).
-    pub async fn get_aggregated_metrics(&self) -> serde_json::Value {
-        let local_metrics = self.metrics.get()
-            .map(|m| m.to_json())
-            .unwrap_or_else(|| serde_json::json!({}));
-
-        let request = RequestType::GetMetrics;
-        match self.pubsub.request(&self.node_id, request).await {
-            Ok(responses) => {
-                let mut merged = local_metrics;
-                for r in responses {
-                    if let ResponsePayload::Metrics(remote) = r {
-                        merge_metrics(&mut merged, &remote);
-                    }
-                }
-                merged
-            }
-            Err(e) => {
-                warn!("Failed to query peer metrics: {}", e);
-                local_metrics
-            }
-        }
-    }
-
     /// Collect local stats for this node (per-app connection counts and channel socket counts).
     async fn collect_local_stats(&self) -> serde_json::Value {
         let app_ids = self.local.get_app_ids();
@@ -105,10 +165,13 @@ impl RedisAdapter {
                 let count = self.local.get_channel_socket_count(&app_id, ch).await;
                 ch_map.insert(ch.clone(), serde_json::json!(count));
             }
-            apps.insert(app_id, serde_json::json!({
-                "connections": connections,
-                "channels": ch_map,
-            }));
+            apps.insert(
+                app_id,
+                serde_json::json!({
+                    "connections": connections,
+                    "channels": ch_map,
+                }),
+            );
         }
         serde_json::json!(apps)
     }
@@ -119,9 +182,7 @@ impl RedisAdapter {
         if node_ids.is_empty() {
             return vec![];
         }
-        let keys: Vec<String> = node_ids.iter()
-            .map(|id| self.node_stats_key(id))
-            .collect();
+        let keys: Vec<String> = node_ids.iter().map(|id| self.node_stats_key(id)).collect();
         let mut conn = self.cmd_conn.lock().await;
         let values: Vec<Option<String>> = match conn.mget(&keys).await {
             Ok(v) => v,
@@ -130,15 +191,17 @@ impl RedisAdapter {
                 return vec![];
             }
         };
-        values.into_iter()
+        values
+            .into_iter()
             .filter_map(|v| v.and_then(|s| serde_json::from_str(&s).ok()))
             .collect()
     }
 
     /// Background loop: write local stats to Redis every 5 seconds with 15s TTL.
+    /// Writes immediately on start so peers cannot reap this node's quota field
+    /// during the first 5s window.
     async fn stats_heartbeat_loop(self: Arc<Self>) {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let stats = self.collect_local_stats().await;
             let json = serde_json::to_string(&stats).unwrap_or_default();
             let key = self.node_stats_key(&self.node_id);
@@ -153,6 +216,38 @@ impl RedisAdapter {
             if let Err(e) = result {
                 warn!("Failed to write stats heartbeat: {}", e);
             }
+            drop(conn);
+
+            let mut pipe = redis::pipe();
+            let mut expire_any = false;
+            for app_id in self.local.get_app_ids() {
+                let channels = self.local.get_channels(&app_id).await;
+                for ch in channels {
+                    if self.local.get_channel_socket_count(&app_id, &ch).await > 0 {
+                        pipe.cmd("EXPIRE")
+                            .arg(self.occupancy_key(&app_id, &ch))
+                            .arg(OCCUPANCY_TTL_SECS);
+                        expire_any = true;
+                    }
+                }
+            }
+            if expire_any {
+                let mut conn = self.cmd_conn.lock().await;
+                if let Err(e) = pipe.query_async::<()>(&mut *conn).await {
+                    warn!("Failed to refresh occupancy TTL: {e}");
+                }
+            }
+
+            // SET-absolute the per-node quota field from live local counts (lock order: quota then cmd).
+            for app_id in self.local.get_app_ids() {
+                let lock = self.quota_lock(&app_id);
+                let _g = lock.lock().await;
+                let count = self.local.get_connection_count(&app_id).await as i64;
+                if let Err(e) = self.quota_eval(&app_id, Some(count), -1).await {
+                    warn!("Failed to heartbeat quota HASH for app {app_id}: {e}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     }
 
@@ -186,13 +281,16 @@ impl RedisAdapter {
             } => {
                 // Deliver to local sockets (String→Bytes is zero-copy ownership transfer)
                 self.local
-                    .send_to_channel(app_id, channel, Bytes::from(message.clone()), excepting_id.as_deref())
+                    .send_to_channel(
+                        app_id,
+                        channel,
+                        Bytes::from(message.clone()),
+                        excepting_id.as_deref(),
+                    )
                     .await;
             }
             pubsub::BroadcastMessage::TerminateUser { app_id, user_id } => {
-                self.local
-                    .terminate_user_connections(app_id, user_id)
-                    .await;
+                self.local.terminate_user_connections(app_id, user_id).await;
             }
             pubsub::BroadcastMessage::Heartbeat => {
                 // No-op — heartbeats are handled in the subscriber loop
@@ -201,78 +299,13 @@ impl RedisAdapter {
     }
 
     /// Handle an incoming request from another node and produce a response.
-    pub async fn handle_request(
-        &self,
-        request: &request_response::Request,
-    ) -> ResponsePayload {
+    pub async fn handle_request(&self, request: &request_response::Request) -> ResponsePayload {
         match &request.request_type {
-            RequestType::GetConnectionCount { app_id } => {
-                let count = self.local.get_connection_count(app_id).await;
-                ResponsePayload::Count(count)
-            }
-            RequestType::GetChannels { app_id } => {
-                let channels = self.local.get_channels(app_id).await;
-                ResponsePayload::Channels(channels)
-            }
             RequestType::GetChannelSocketCount { app_id, channel } => {
                 let count = self.local.get_channel_socket_count(app_id, channel).await;
                 ResponsePayload::Count(count)
             }
-            RequestType::GetChannelInfo { app_id, channel } => {
-                let info = self.local.get_channel_info(app_id, channel).await;
-                ResponsePayload::ChannelInfo {
-                    occupied: info.occupied,
-                    subscription_count: info.subscription_count,
-                    user_count: info.user_count,
-                }
-            }
-            RequestType::GetPresenceMembers { app_id, channel } => {
-                let members = self.local.get_presence_members(app_id, channel).await;
-                ResponsePayload::PresenceMembers(members)
-            }
-            RequestType::GetPresenceUserCount { app_id, channel } => {
-                let count = self.local.get_presence_user_count(app_id, channel).await;
-                ResponsePayload::Count(count)
-            }
-            RequestType::GetChannelSockets { app_id, channel } => {
-                let sockets = self.local.get_channel_sockets(app_id, channel).await;
-                ResponsePayload::SocketIds(sockets)
-            }
-            RequestType::GetMetrics => {
-                let metrics_json = self.metrics.get()
-                    .map(|m| m.to_json())
-                    .unwrap_or_else(|| serde_json::json!({}));
-                ResponsePayload::Metrics(metrics_json)
-            }
-            RequestType::DiscoverPeers => {
-                ResponsePayload::Ack
-            }
-        }
-    }
-}
-
-/// Merge remote metrics into local metrics by summing numeric fields.
-fn merge_metrics(local: &mut serde_json::Value, remote: &serde_json::Value) {
-    if let (Some(l), Some(r)) = (local.as_object_mut(), remote.as_object()) {
-        for (key, remote_val) in r {
-            if key == "apps" {
-                // Merge per-app metrics
-                if let (Some(l_apps), Some(r_apps)) = (
-                    l.entry(key).or_insert_with(|| serde_json::json!({})).as_object_mut(),
-                    remote_val.as_object(),
-                ) {
-                    for (app_id, r_app) in r_apps {
-                        let l_app = l_apps.entry(app_id).or_insert_with(|| serde_json::json!({}));
-                        merge_metrics(l_app, r_app);
-                    }
-                }
-            } else if let (Some(l_val), Some(r_num)) = (l.get_mut(key), remote_val.as_i64()) {
-                if let Some(l_num) = l_val.as_i64() {
-                    *l_val = serde_json::json!(l_num + r_num);
-                }
-            } else if remote_val.is_number() {
-                l.entry(key).or_insert(remote_val.clone());
-            }
+            RequestType::DiscoverPeers => ResponsePayload::Ack,
         }
     }
 }
@@ -283,12 +316,44 @@ impl Adapter for RedisAdapter {
         self.local.add_socket(app_id, conn).await;
     }
 
-    async fn try_add_socket(&self, app_id: &str, conn: Arc<WsConnection>, limit: i64) -> bool {
-        self.local.try_add_socket(app_id, conn, limit).await
+    async fn try_add_socket(&self, app_id: &str, conn: Arc<WsConnection>, limit: i64) -> Admit {
+        let lock = self.quota_lock(app_id);
+        let _g = lock.lock().await;
+        let local_count = self.local.get_connection_count(app_id).await as i64;
+        let next = local_count + 1;
+        match self.quota_eval(app_id, Some(next), limit).await {
+            Ok((ok, _)) => match map_quota_eval(limit, Ok(ok)) {
+                Admit::Ok => {}
+                other => return other,
+            },
+            Err(e) => {
+                warn!("Redis quota EVAL failed: {e}");
+                match map_quota_eval(limit, Err(())) {
+                    Admit::Ok => {}
+                    other => return other,
+                }
+            }
+        }
+        match self.local.try_add_socket(app_id, conn, -1).await {
+            Admit::Ok => Admit::Ok,
+            other => {
+                if let Err(e) = self.quota_eval(app_id, Some(local_count), -1).await {
+                    warn!("Redis quota rollback failed: {e}");
+                }
+                other
+            }
+        }
     }
 
     async fn remove_socket(&self, app_id: &str, socket_id: &str) -> Vec<String> {
-        self.local.remove_socket(app_id, socket_id).await
+        let lock = self.quota_lock(app_id);
+        let _g = lock.lock().await;
+        let vacated = self.local.remove_socket(app_id, socket_id).await;
+        let count = self.local.get_connection_count(app_id).await as i64;
+        if let Err(e) = self.quota_eval(app_id, Some(count), -1).await {
+            warn!("Redis quota HSET on remove failed: {e}");
+        }
+        vacated
     }
 
     async fn add_to_channel(&self, app_id: &str, socket_id: &str, channel: &str) -> bool {
@@ -327,14 +392,13 @@ impl Adapter for RedisAdapter {
     }
 
     async fn get_connection_count(&self, app_id: &str) -> usize {
-        let local_count = self.local.get_connection_count(app_id).await;
-        let remote_stats = self.read_remote_stats().await;
-        let remote_count: usize = remote_stats.iter()
-            .filter_map(|s| s.get(app_id))
-            .filter_map(|a| a["connections"].as_u64())
-            .map(|c| c as usize)
-            .sum();
-        local_count + remote_count
+        match self.quota_eval(app_id, None, -1).await {
+            Ok((_, sum)) => sum.max(0) as usize,
+            Err(e) => {
+                warn!("Redis quota GET failed: {e}");
+                self.local.get_connection_count(app_id).await
+            }
+        }
     }
 
     async fn get_channels(&self, app_id: &str) -> Vec<String> {
@@ -342,10 +406,10 @@ impl Adapter for RedisAdapter {
             self.local.get_channels(app_id).await.into_iter().collect();
         let remote_stats = self.read_remote_stats().await;
         for stats in &remote_stats {
-            if let Some(app) = stats.get(app_id) {
-                if let Some(channels) = app["channels"].as_object() {
-                    all_channels.extend(channels.keys().cloned());
-                }
+            if let Some(app) = stats.get(app_id)
+                && let Some(channels) = app["channels"].as_object()
+            {
+                all_channels.extend(channels.keys().cloned());
             }
         }
         all_channels.into_iter().collect()
@@ -369,7 +433,8 @@ impl Adapter for RedisAdapter {
     async fn get_channel_socket_count(&self, app_id: &str, channel: &str) -> usize {
         let local_count = self.local.get_channel_socket_count(app_id, channel).await;
         let remote_stats = self.read_remote_stats().await;
-        let remote_count: usize = remote_stats.iter()
+        let remote_count: usize = remote_stats
+            .iter()
             .filter_map(|s| s.get(app_id))
             .filter_map(|a| a["channels"].as_object())
             .filter_map(|ch| ch.get(channel))
@@ -410,32 +475,16 @@ impl Adapter for RedisAdapter {
         user_id: &str,
         user_info: &serde_json::Value,
     ) -> bool {
-        // Local tracking for socket-level disconnect cleanup
-        self.local
-            .add_presence_member(app_id, channel, socket_id, user_id, user_info)
-            .await;
-
-        // Global tracking via Redis: increment socket count for this user
-        let psock_key = self.presence_sockets_key(app_id, channel);
-        let mut conn = self.cmd_conn.lock().await;
-        let count: i64 = match conn.hincr(&psock_key, user_id, 1i64).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Redis HINCRBY for presence add failed: {}", e);
-                return false;
-            }
-        };
-        let is_new = count == 1;
-        if is_new {
-            let presence_key = self.presence_key(app_id, channel);
-            let info_json = serde_json::to_string(user_info).unwrap_or_default();
-            if let Err(e) = conn.hset::<_, _, _, ()>(&presence_key, user_id, &info_json).await {
-                warn!("Redis HSET for presence member failed: {}", e);
-            }
+        match self
+            .try_add_presence_member(app_id, channel, socket_id, user_id, user_info, usize::MAX)
+            .await
+        {
+            Ok((is_new, _)) => is_new,
+            Err(()) => false,
         }
-        is_new
     }
 
+    #[allow(clippy::result_unit_err)]
     async fn try_add_presence_member(
         &self,
         app_id: &str,
@@ -447,31 +496,31 @@ impl Adapter for RedisAdapter {
     ) -> Result<(bool, HashMap<String, serde_json::Value>), ()> {
         let presence_key = self.presence_key(app_id, channel);
         let psock_key = self.presence_sockets_key(app_id, channel);
+        let info_json = serde_json::to_string(user_info).unwrap_or_default();
+        let max = if max_members == usize::MAX {
+            i64::MAX
+        } else {
+            max_members as i64
+        };
 
-        // Check global member limit via Redis
-        let mut conn = self.cmd_conn.lock().await;
-        let current_count: usize = conn.hlen(&presence_key).await.unwrap_or(0);
-        let already_exists: bool = conn.hexists(&presence_key, user_id).await.unwrap_or(false);
-        if !already_exists && current_count >= max_members {
+        let (accepted, is_new) = match self
+            .presence_add_eval(&presence_key, &psock_key, user_id, &info_json, max)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Redis presence add EVAL failed: {e}");
+                return Err(());
+            }
+        };
+        if !accepted {
             return Err(());
         }
 
-        // Local add for socket tracking (ignore local is_new, use Redis-based one)
-        let _ = self
-            .local
+        self.local
             .add_presence_member(app_id, channel, socket_id, user_id, user_info)
             .await;
 
-        // Redis: increment socket count and store user info if new
-        let count: i64 = conn.hincr(&psock_key, user_id, 1i64).await.unwrap_or(1);
-        let is_new = count == 1;
-        if is_new {
-            let info_json = serde_json::to_string(user_info).unwrap_or_default();
-            let _ = conn.hset::<_, _, _, ()>(&presence_key, user_id, &info_json).await;
-        }
-        drop(conn);
-
-        // Get members from Redis for subscription_succeeded response
         let members = self.get_presence_members(app_id, channel).await;
         Ok((is_new, members))
     }
@@ -483,36 +532,25 @@ impl Adapter for RedisAdapter {
         socket_id: &str,
         user_id: &str,
     ) -> bool {
-        // Local remove (tracks per-socket state)
+        let presence_key = self.presence_key(app_id, channel);
+        let psock_key = self.presence_sockets_key(app_id, channel);
+        let gone = match self
+            .presence_remove_eval(&presence_key, &psock_key, user_id)
+            .await
+        {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("Redis presence remove EVAL failed: {e}");
+                return self
+                    .local
+                    .remove_presence_member(app_id, channel, socket_id, user_id)
+                    .await;
+            }
+        };
         self.local
             .remove_presence_member(app_id, channel, socket_id, user_id)
             .await;
-
-        // Global remove via Redis: decrement socket count
-        let psock_key = self.presence_sockets_key(app_id, channel);
-        let mut conn = self.cmd_conn.lock().await;
-        let count: i64 = match conn.hincr(&psock_key, user_id, -1i64).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Redis HINCRBY for presence remove failed: {}", e);
-                return false;
-            }
-        };
-        if count <= 0 {
-            // User has no more sockets globally — remove from presence hash
-            let presence_key = self.presence_key(app_id, channel);
-            let _ = conn.hdel::<_, _, ()>(&presence_key, user_id).await;
-            let _ = conn.hdel::<_, _, ()>(&psock_key, user_id).await;
-
-            // Clean up empty hashes
-            let remaining: usize = conn.hlen(&presence_key).await.unwrap_or(1);
-            if remaining == 0 {
-                let _ = conn.del::<_, ()>(&presence_key).await;
-                let _ = conn.del::<_, ()>(&psock_key).await;
-            }
-            return true;
-        }
-        false
+        gone
     }
 
     async fn get_presence_user_count(&self, app_id: &str, channel: &str) -> usize {
@@ -528,20 +566,14 @@ impl Adapter for RedisAdapter {
         }
     }
 
-    async fn get_sockets_for_user(
-        &self,
-        app_id: &str,
-        user_id: &str,
-    ) -> Vec<Arc<WsConnection>> {
+    async fn get_sockets_for_user(&self, app_id: &str, user_id: &str) -> Vec<Arc<WsConnection>> {
         // Only return local sockets (can't return remote Arc<WsConnection>)
         self.local.get_sockets_for_user(app_id, user_id).await
     }
 
     async fn terminate_user_connections(&self, app_id: &str, user_id: &str) {
         // Terminate locally
-        self.local
-            .terminate_user_connections(app_id, user_id)
-            .await;
+        self.local.terminate_user_connections(app_id, user_id).await;
 
         // Broadcast to other nodes
         let broadcast = pubsub::BroadcastMessage::TerminateUser {
@@ -553,39 +585,8 @@ impl Adapter for RedisAdapter {
         }
     }
 
-    async fn get_socket(
-        &self,
-        app_id: &str,
-        socket_id: &str,
-    ) -> Option<Arc<WsConnection>> {
+    async fn get_socket(&self, app_id: &str, socket_id: &str) -> Option<Arc<WsConnection>> {
         self.local.get_socket(app_id, socket_id).await
-    }
-
-    async fn get_aggregated_metrics(&self) -> Option<serde_json::Value> {
-        Some(RedisAdapter::get_aggregated_metrics(self).await)
-    }
-
-    async fn get_channel_sockets(&self, app_id: &str, channel: &str) -> Vec<String> {
-        let mut all_sockets: std::collections::HashSet<String> = self
-            .local
-            .get_channel_sockets(app_id, channel)
-            .await
-            .into_iter()
-            .collect();
-
-        let request = RequestType::GetChannelSockets {
-            app_id: app_id.to_string(),
-            channel: channel.to_string(),
-        };
-        if let Ok(responses) = self.pubsub.request(&self.node_id, request).await {
-            for r in responses {
-                if let ResponsePayload::SocketIds(ids) = r {
-                    all_sockets.extend(ids);
-                }
-            }
-        }
-
-        all_sockets.into_iter().collect()
     }
 
     async fn get_local_connection_count(&self, app_id: &str) -> usize {
@@ -594,10 +595,6 @@ impl Adapter for RedisAdapter {
 
     async fn get_local_channels(&self, app_id: &str) -> Vec<String> {
         self.local.get_channels(app_id).await
-    }
-
-    async fn get_local_presence_user_count(&self, app_id: &str, channel: &str) -> usize {
-        self.local.get_presence_user_count(app_id, channel).await
     }
 
     async fn add_user(&self, app_id: &str, user_id: &str, socket_id: &str) {
@@ -619,13 +616,20 @@ impl Adapter for RedisAdapter {
         }
         let key = self.occupancy_key(app_id, channel);
         let mut conn = self.cmd_conn.lock().await;
-        // SETNX returns true only if the key was newly set (first node to claim occupancy)
-        match conn.set_nx::<_, _, bool>(&key, &self.node_id).await {
-            Ok(was_set) => was_set,
+        match redis::cmd("SET")
+            .arg(&key)
+            .arg(&self.node_id)
+            .arg("NX")
+            .arg("EX")
+            .arg(OCCUPANCY_TTL_SECS)
+            .query_async::<Option<String>>(&mut *conn)
+            .await
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
             Err(e) => {
-                warn!("Redis SETNX for channel occupancy failed: {}", e);
-                // Fallback to local state on Redis error
-                locally_occupied
+                warn!("Redis SET NX EX for channel occupancy failed: {}", e);
+                false
             }
         }
     }
@@ -650,19 +654,36 @@ impl Adapter for RedisAdapter {
             app_id: app_id.to_string(),
             channel: channel.to_string(),
         };
-        if let Ok(responses) = self.pubsub.request(&self.node_id, request).await {
-            let remote: usize = responses
-                .iter()
-                .filter_map(|r| match r {
-                    ResponsePayload::Count(c) => Some(*c),
-                    _ => None,
-                })
-                .sum();
-            if remote > 0 {
-                return false;
+        let complete_zero = match self.pubsub.request(&self.node_id, request).await {
+            Ok(batch) => {
+                let remote: usize = batch
+                    .responses
+                    .iter()
+                    .filter_map(|r| match r {
+                        ResponsePayload::Count(c) => Some(*c),
+                        _ => None,
+                    })
+                    .sum();
+                if vacated_from_peer_rpc(batch.expected, batch.responses.len(), remote) {
+                    true
+                } else {
+                    warn!(
+                        expected = batch.expected,
+                        received = batch.responses.len(),
+                        remote,
+                        "Vacate RPC incomplete; not deleting occupancy"
+                    );
+                    false
+                }
             }
+            Err(e) => {
+                warn!("Vacate RPC failed: {e}");
+                false
+            }
+        };
+        if !complete_zero {
+            return false;
         }
-        // No subscribers anywhere — clean up the occupancy key
         let key = self.occupancy_key(app_id, channel);
         let mut conn = self.cmd_conn.lock().await;
         if let Err(e) = conn.del::<_, ()>(&key).await {
@@ -673,5 +694,103 @@ impl Adapter for RedisAdapter {
 
     fn is_ready(&self) -> bool {
         self.pubsub.is_subscribed()
+    }
+
+    async fn local_sockets(&self) -> Vec<Arc<WsConnection>> {
+        self.local.local_sockets().await
+    }
+}
+
+#[cfg(test)]
+mod occupancy_tests {
+    use super::vacated_from_peer_rpc;
+
+    #[test]
+    fn expected_zero_is_vacated() {
+        assert!(vacated_from_peer_rpc(0, 0, 0));
+    }
+
+    #[test]
+    fn complete_zero_is_vacated() {
+        assert!(vacated_from_peer_rpc(2, 2, 0));
+    }
+
+    #[test]
+    fn timeout_partial_is_not_vacated() {
+        assert!(!vacated_from_peer_rpc(3, 1, 0));
+        assert!(!vacated_from_peer_rpc(2, 0, 0));
+    }
+
+    #[test]
+    fn complete_but_remote_members_is_not_vacated() {
+        assert!(!vacated_from_peer_rpc(2, 2, 5));
+    }
+
+    #[test]
+    fn oneshot_cancel_empty_with_peers_is_not_vacated() {
+        assert!(!vacated_from_peer_rpc(1, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    /// Optional live Redis check. Compiles in every `cargo test`; no-ops without REDIS_URL.
+    /// CI: export REDIS_URL=redis://127.0.0.1:6379
+    #[tokio::test]
+    async fn quota_lua_set_get_and_reap() {
+        let Ok(url) = std::env::var("REDIS_URL") else {
+            eprintln!("skipping live Redis test (set REDIS_URL to run)");
+            return;
+        };
+        let client = redis::Client::open(url.as_str()).expect("redis url");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("redis connect");
+        let hash = format!("rushsocket-test:connections:{}", uuid::Uuid::new_v4());
+        let node = "node-a";
+        let stats_prefix = "rushsocket-test:node_stats:";
+        let stats_key = format!("{stats_prefix}{node}");
+        let _: () = redis::cmd("SET")
+            .arg(&stats_key)
+            .arg("{}")
+            .arg("EX")
+            .arg(15)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let set: Vec<i64> = redis::cmd("EVAL")
+            .arg(super::lua::QUOTA_LUA)
+            .arg(1)
+            .arg(&hash)
+            .arg(node)
+            .arg(2)
+            .arg(10)
+            .arg(1)
+            .arg(stats_prefix)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(set[0], 1);
+        assert_eq!(set[1], 2);
+        let get: Vec<i64> = redis::cmd("EVAL")
+            .arg(super::lua::QUOTA_LUA)
+            .arg(1)
+            .arg(&hash)
+            .arg(node)
+            .arg(0)
+            .arg(-1)
+            .arg(0)
+            .arg(stats_prefix)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(get[1], 2);
+        let _: () = redis::cmd("DEL")
+            .arg(&hash)
+            .arg(&stats_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
     }
 }
