@@ -59,7 +59,7 @@ Built in Rust. No garbage collector, no runtime, no bloat. One binary that handl
 - 🌐 **HTTP REST API** — trigger events, batch events, query channels, manage connections, with body MD5 integrity verification
 - 🪝 **Webhooks** — Pusher-compatible webhook delivery with HMAC-SHA256 signing, batching, and retries
 - 🛡️ **Rate limiting** — per-app limits on connections, events/sec, and read requests/sec
-- 📈 **Horizontal scaling** — Redis adapter with pub/sub broadcasting, global presence via Redis Hashes, and stats heartbeats
+- 📈 **Horizontal scaling** — Redis adapter with pub/sub broadcasting, global presence with expiring per-node rosters, and stats heartbeats
 - 🔒 **TLS/SSL** — built-in via rustls, no external proxy required
 - 🐧 **Systemd support** — Type=notify integration with sd-notify for reliable service management
 - 📊 **Rich stats endpoint** — server, process, system, and per-app metrics
@@ -87,7 +87,7 @@ curl -sSfL https://raw.githubusercontent.com/rushsocket/rushsocket/main/install.
 To install a specific version:
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/rushsocket/rushsocket/main/install.sh | sudo bash -s -- v1.1.0
+curl -sSfL https://raw.githubusercontent.com/rushsocket/rushsocket/main/install.sh | sudo bash -s -- v1.2.0
 ```
 
 Supported platforms: **Linux** and **macOS** only. Windows is not supported.
@@ -396,7 +396,7 @@ rushsocket sends Pusher-compatible webhook notifications to your server when eve
 | `channel_occupied` | First subscriber joins a channel | `{"name": "channel_occupied", "channel": "my-channel"}` |
 | `channel_vacated` | Last subscriber leaves a channel | `{"name": "channel_vacated", "channel": "my-channel"}` |
 
-In Redis cluster mode, these are deduplicated globally (`SET NX EX 15`, refreshed from the 5s stats heartbeat). `channel_vacated` fires only when every known peer answers with zero subscribers — timeout or missing replies do **not** fire vacated. See [Distributed Occupancy](#-horizontal-scaling-with-redis).
+In Redis cluster mode, these are deduplicated globally (a 15-second occupancy claim, refreshed from the 5s stats heartbeat). `channel_vacated` fires only when every known peer answers with zero subscribers — timeout or missing replies do **not** fire vacated. See [Distributed Occupancy](#-horizontal-scaling-with-redis).
 
 #### 💾 Cache Channel Events
 
@@ -411,7 +411,7 @@ In Redis cluster mode, these are deduplicated globally (`SET NX EX 15`, refreshe
 | `member_added` | New user subscribes to a presence channel | `{"name": "member_added", "channel": "presence-room", "user_id": "user-42"}` |
 | `member_removed` | User unsubscribes from a presence channel (all sockets disconnected) | `{"name": "member_removed", "channel": "presence-room", "user_id": "user-42"}` |
 
-In Redis cluster mode, presence state is stored globally in Redis Hashes. A user is considered "removed" only when they have no sockets on any node.
+In Redis mode each node refreshes its presence rosters every five seconds. A crashed node’s memberships expire within 20 seconds of its last refresh. A user is considered "removed" only when they have no sockets on any node.
 
 #### 💬 Client Events
 
@@ -502,7 +502,7 @@ Stats are computed every 2 seconds in a background task. Process and system metr
 
 ## 🔴 Horizontal Scaling with Redis
 
-For multi-node deployments, rushsocket uses Redis for cross-node coordination: pub/sub for event broadcasting, Hashes for global presence state, and key-value pairs for stats aggregation.
+For multi-node deployments, rushsocket uses Redis for cross-node coordination: pub/sub for event broadcasting, leased per-node presence rosters, and key-value pairs for stats aggregation.
 
 **1️⃣ Set up Redis** (version 6+ recommended).
 
@@ -525,9 +525,9 @@ rushsocket stores the following keys in Redis (all prefixed with the configured 
 
 | Key Pattern | Type | Purpose | TTL |
 |---|---|---|---|
-| `{prefix}:occupied:{app}:{channel}` | String | 🏠 Channel occupancy flag (`SET NX EX`) | 15s (refreshed every 5s by every node with local subscribers) |
-| `{prefix}:presence:{app}:{channel}` | Hash | 👥 Presence members: `user_id` -> `user_info JSON` | None |
-| `{prefix}:psock:{app}:{channel}` | Hash | 🔢 Presence socket counts: `user_id` -> `count` | None |
+| `{prefix}:occupied:{app}:{channel}` | String | 🏠 Channel occupancy token | 15s (refreshed every 5s by every node with local subscribers) |
+| `{prefix}:presence_nodes:{app}:{channel}` | Set | Keys of nodes with members on this channel | 20s, refreshed by active nodes |
+| `{prefix}:presence_nodes:{app}:{channel}:{node_id}` | String | This node’s current presence members | 20s |
 | `{prefix}:connections:{app}` | Hash | 🔗 Cluster connection quota: `node_id` -> local count (SET-absolute; reaped when `node_stats` expires) | None |
 | `{prefix}:node_stats:{node_id}` | String | 📊 Node stats JSON (connections, channels) | 15s |
 | `{prefix}:cache:{app}:{channel}` | String | 💾 Last cache-channel event (via RedisCache; prefix applied inside the driver) | `cache_ttl` |
@@ -537,20 +537,26 @@ rushsocket stores the following keys in Redis (all prefixed with the configured 
 
 ### 🔧 Cluster Features
 
-**👥 Global Presence (Redis Hashes):** Presence members are stored in Redis Hashes, not local memory. When a user joins a presence channel, their info is written to Redis via `HSET`. When they leave (no sockets on any node), they're removed via `HDEL`. Queries like `get_presence_members` and `get_presence_user_count` read directly from Redis with `HGETALL` and `HLEN` — no cross-node broadcasting needed.
+**Upgrading a Redis deployment from v1.1.0 or earlier.** Drain and stop all old RushSocket nodes before starting this build. The presence key format and the termination RPC changed. Clients rebuild presence on reconnect. Any legacy presence and psock hashes left by earlier crashes are ignored. Preserve the Redis cache keys.
+
+**Event publishing.** A Redis publish failure returns HTTP 503. Local recipients or earlier items in a batch may already have received the event. Use an application event ID for deduplication when retrying.
+
+**Global presence.** Redis merges live node rosters and checks the channel member limit atomically. Multiple sockets belonging to one user occupy one member slot. A Redis restart triggers restoration from connected clients on each node. Lease expiry cleans up crash state without generating a member-removed webhook.
+
+**User termination.** The HTTP endpoint returns 503 when the cluster cannot confirm the request. A successful request means the live target nodes have marked the user’s existing connections for closure. Callers can retry an incomplete request. A node that loses its revocation subscription closes its signed-in connections. Those clients must reconnect and sign in again.
 
 **📊 Node Stats Heartbeats:** Every 5 seconds, each node writes its local stats (per-app connection counts and channel socket counts) to a Redis key with a 15-second TTL. Stats queries (`get_connection_count`, `get_channels`, `get_channel_socket_count`) read fresh local data plus cached remote data via `MGET` — no cross-node broadcasting needed. If a node crashes, its stats expire in 15 seconds.
 
-**🏠 Distributed Occupancy (SET NX EX / DEL):** `channel_occupied` and `channel_vacated` webhooks are deduplicated across the cluster. The first node to see a subscriber uses `SET NX EX 15` to claim the occupancy flag. Every node with local subscribers refreshes `EXPIRE 15` from the 5s stats heartbeat. The last node to see all subscribers leave verifies with a complete peer count (timeout or missing replies do **not** fire vacated). If a vacate RPC times out, the key may expire after 15s and the next join can emit `channel_occupied` without a matching `channel_vacated`.
+**🏠 Distributed occupancy:** `channel_occupied` and `channel_vacated` webhooks are deduplicated across the cluster. The first node to see a subscriber claims a 15-second occupancy token. Each first-local join changes the token, and a vacate can clear only the token it checked. Every node with local subscribers refreshes `EXPIRE 15` from the 5s stats heartbeat. The last node to see all subscribers leave verifies with a complete peer count (timeout or missing replies do **not** fire vacated). If a vacate RPC times out, the key may expire after 15s and the next join can emit `channel_occupied` without a matching `channel_vacated`.
 
 ### ⚙️ Redis Adapter Behavior
 
 - 🔍 **Peer discovery:** On startup (and after each reconnect), each node publishes an announce heartbeat and sends a discovery request to all peers. Peers respond, populating the node's peer registry. The `/ready` endpoint returns `503` until this completes.
 - 💓 **Heartbeats:** Each node publishes a heartbeat every 30 seconds to keep connections alive and maintain the peer registry. Peers not seen for 60 seconds are pruned.
-- 🔄 **Reconnect handling:** If the Redis subscriber connection drops, the node marks itself not-ready, reconnects, resubscribes, and re-discovers peers before accepting traffic again. A generation counter prevents stale discovery tasks from incorrectly restoring readiness.
+- 🔄 **Reconnect handling:** If the Redis subscriber connection drops, the node marks itself not-ready, reconnects, resubscribes, and re-discovers peers before accepting traffic again. Readiness returns after peer discovery and a successful command heartbeat restore the node’s state.
 - 🔀 **Connection splitting:** Broadcast traffic (channel messages, heartbeats) and control traffic (cross-node requests/responses) use separate Redis connections to prevent head-of-line blocking.
-- 📏 **Cluster connection quota:** With the Redis adapter, `max_connections` is enforced cluster-wide via a per-app HASH (`HSET` this node's local count, sum `HVALS`). Fields for crashed nodes are reaped when their `node_stats` key expires. If Redis EVAL fails: unlimited apps (`max_connections = -1`) still admit; finite apps get `pusher:error` **4009** `"Connection unavailable"` (not 4004). Presence member limits remain live-node Lua (crash-ghosted members are not reaped). Local adapter quotas stay per-process.
-- ⏰ **Subscriber timeout:** If no message is received on the subscriber for 90 seconds (including heartbeats), the connection is assumed dead and a reconnect is forced.
+- 📏 **Cluster connection quota:** With the Redis adapter, `max_connections` is enforced cluster-wide via a per-app HASH (`HSET` this node's local count, sum `HVALS`). Fields for crashed nodes are reaped when their `node_stats` key expires. If Redis EVAL fails: unlimited apps (`max_connections = -1`) still admit; finite apps get `pusher:error` **4009** `"Connection unavailable"` (not 4004). Presence limits count unique users across unexpired node rosters. Local adapter quotas stay per-process.
+- ⏰ **Subscriber timeout:** If no message is received on the subscriber for 45 seconds (including heartbeats), the connection is assumed dead and a reconnect is forced.
 
 ---
 
@@ -671,7 +677,7 @@ HTTP `filter_by_prefix=presence-` matches Pusher `presence-cache-*` names. Legac
 rushsocket uses an adapter pattern to abstract single-node vs. multi-node operation:
 
 - **Local adapter:** All state is in-memory using lock-free `DashMap` structures. Suitable for single-node deployments.
-- **Redis adapter:** Wraps the local adapter and adds Redis for cross-node coordination. Channel messages are broadcast via pub/sub. Presence state is stored in Redis Hashes. Stats are exchanged via periodic heartbeat keys with TTL. A request/response protocol is used for real-time vacate completeness checks.
+- **Redis adapter:** Wraps the local adapter and adds Redis for cross-node coordination. Channel messages are broadcast via pub/sub. Presence state is stored in expiring per-node rosters. Stats are exchanged via periodic heartbeat keys with TTL. A request/response protocol is used for real-time vacate completeness checks.
 
 ### 🧠 Key Design Decisions
 
@@ -679,8 +685,8 @@ rushsocket uses an adapter pattern to abstract single-node vs. multi-node operat
 - ⚛️ **Atomic presence limits:** Presence member limits are checked and enforced while holding the DashMap entry guard, preventing over-admission races.
 - 📋 **Zero-copy fan-out:** Channel messages are serialized once into `bytes::Bytes` (reference-counted), then shared across all recipients without per-socket copies.
 - 🧠 **Non-blocking memory checks:** Memory usage is sampled every 2 seconds by a background task and cached in an `AtomicU64`. The WebSocket handshake reads a single atomic — no `/proc` I/O on the hot path.
-- ⚡ **Non-blocking webhooks:** Webhook events are queued via an unbounded mpsc channel. The WebSocket handler never waits for HTTP delivery.
-- 🔄 **Generation-guarded readiness:** Redis reconnects bump an atomic generation counter. Stale peer discovery tasks from previous connections cannot flip the readiness flag.
+- ⚡ **Non-blocking webhooks:** Each app queues up to 4,096 webhook events and runs up to four concurrent deliveries. A full queue drops new events and increments the webhook drop counter. The WebSocket handler never waits for HTTP delivery.
+- 🔄 **Redis readiness:** Each subscription owns its discovery operation. Reconnecting cancels pending discovery and refreshes the command heartbeat before the node accepts new connections.
 - 🔐 **Lock safety:** Per-connection state uses `parking_lot::Mutex` which never poisons. A panicked thread cannot cascade into server-wide lock failures.
 - 🛡️ **Body integrity:** POST requests with a `body_md5` query parameter are verified against the actual request body, catching tampering or corruption in transit.
 
@@ -695,7 +701,7 @@ src/
 │   ├── local.rs     #   Single-node in-memory adapter
 │   ├── namespace.rs #   Per-app state (sockets, channels, presence)
 │   └── redis/       #   Multi-node Redis adapter
-│       ├── mod.rs   #     Redis adapter (presence hashes, stats heartbeats, occupancy)
+│       ├── mod.rs   #     Redis adapter (presence rosters, stats heartbeats, occupancy)
 │       ├── pubsub.rs#     Pub/sub, heartbeats, peer discovery
 │       └── request_response.rs # Cross-node RPC types
 ├── app/             # 📱 App management and lookup

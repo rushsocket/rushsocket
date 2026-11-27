@@ -448,6 +448,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_concurrent_http_requests > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err("max_concurrent_http_requests exceeds the runtime semaphore limit".into());
+        }
+        if self.server_ping_interval == 0 || self.server_pong_timeout == 0 {
+            return Err("server_ping_interval and server_pong_timeout must be positive".into());
+        }
+        if self.adapter == "redis" && self.redis.request_timeout == 0 {
+            return Err("redis.request_timeout must be positive".into());
+        }
         match self.adapter.as_str() {
             "local" | "redis" => {}
             other => {

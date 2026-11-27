@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::sync::{Semaphore, mpsc};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, warn};
 
 use crate::app::App;
@@ -44,6 +45,9 @@ struct WebhookWorker {
     rx: mpsc::Receiver<WebhookEvent>,
     batch_interval_ms: u64,
     semaphore: Arc<Semaphore>,
+    shutdown: CancellationToken,
+    tasks: TaskTracker,
+    metrics: Arc<Metrics>,
 }
 
 impl WebhookWorker {
@@ -57,17 +61,18 @@ impl WebhookWorker {
 
         loop {
             tokio::select! {
+                _ = self.shutdown.cancelled(), if !self.rx.is_closed() => self.rx.close(),
                 event = self.rx.recv() => {
                     match event {
                         Some(e) => {
                             batch.push(e);
                             if batch.len() >= WEBHOOK_BATCH_MAX {
-                                self.flush(&mut batch);
+                                self.flush(&mut batch).await;
                             }
                         }
                         None => {
                             if !batch.is_empty() {
-                                self.flush(&mut batch);
+                                self.flush(&mut batch).await;
                             }
                             return;
                         }
@@ -75,14 +80,17 @@ impl WebhookWorker {
                 }
                 _ = ticker.tick() => {
                     if !batch.is_empty() {
-                        self.flush(&mut batch);
+                        self.flush(&mut batch).await;
                     }
                 }
             }
         }
     }
 
-    fn flush(&self, batch: &mut Vec<WebhookEvent>) {
+    async fn flush(&self, batch: &mut Vec<WebhookEvent>) {
+        let Ok(permit) = self.semaphore.clone().acquire_owned().await else {
+            return;
+        };
         let events: Vec<WebhookEvent> = std::mem::take(batch);
         let event_count = events.len();
         let time_ms = SystemTime::now()
@@ -105,11 +113,9 @@ impl WebhookWorker {
         let client = self.client.clone();
         let url = self.url.clone();
         let key = self.key.clone();
-        let semaphore = self.semaphore.clone();
-        tokio::spawn(async move {
-            let Ok(_permit) = semaphore.acquire_owned().await else {
-                return;
-            };
+        let metrics = self.metrics.clone();
+        self.tasks.spawn(async move {
+            let _permit = permit;
             for attempt in 0..3u32 {
                 if attempt > 0 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(1 << attempt)).await;
@@ -125,12 +131,11 @@ impl WebhookWorker {
                     .await
                 {
                     Ok(resp) if resp.status().is_success() => {
-                        debug!(url = %url, events = event_count, "Webhook delivered");
+                        debug!(events = event_count, "Webhook delivered");
                         return;
                     }
                     Ok(resp) if resp.status().is_redirection() => {
                         warn!(
-                            url = %url,
                             status = %resp.status(),
                             attempt = attempt + 1,
                             "Webhook redirect not followed"
@@ -138,7 +143,6 @@ impl WebhookWorker {
                     }
                     Ok(resp) => {
                         warn!(
-                            url = %url,
                             status = %resp.status(),
                             attempt = attempt + 1,
                             "Webhook delivery failed"
@@ -146,15 +150,17 @@ impl WebhookWorker {
                     }
                     Err(e) => {
                         warn!(
-                            url = %url,
-                            error = %e,
+                            error = %e.without_url(),
                             attempt = attempt + 1,
                             "Webhook request error"
                         );
                     }
                 }
             }
-            warn!(url = %url, "Webhook delivery failed after 3 attempts, dropping");
+            metrics
+                .webhook_events_dropped
+                .fetch_add(event_count as u64, std::sync::atomic::Ordering::Relaxed);
+            warn!("Webhook delivery failed after 3 attempts, dropping");
         });
     }
 }
@@ -202,11 +208,15 @@ pub async fn send_subscription_count(
 /// Manages webhook senders for all apps.
 pub struct WebhookManager {
     senders: HashMap<String, WebhookSender>,
+    shutdown: CancellationToken,
+    tasks: TaskTracker,
 }
 
 impl WebhookManager {
     pub fn new(apps: &[Arc<App>], client: reqwest::Client, metrics: Arc<Metrics>) -> Self {
         let mut senders = HashMap::new();
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
 
         for app in apps {
             if let Some(ref url) = app.webhook_url {
@@ -219,9 +229,12 @@ impl WebhookManager {
                     rx,
                     batch_interval_ms: app.webhook_batch_ms,
                     semaphore: Arc::new(Semaphore::new(WEBHOOK_DELIVER_PERMITS)),
+                    shutdown: shutdown.clone(),
+                    tasks: tasks.clone(),
+                    metrics: metrics.clone(),
                 };
 
-                tokio::spawn(worker.run());
+                tasks.spawn(worker.run());
                 senders.insert(
                     app.id.clone(),
                     WebhookSender {
@@ -232,7 +245,17 @@ impl WebhookManager {
             }
         }
 
-        Self { senders }
+        Self {
+            senders,
+            shutdown,
+            tasks,
+        }
+    }
+
+    pub async fn drain(&self) {
+        self.shutdown.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 
     pub fn get(&self, app_id: &str) -> Option<&WebhookSender> {
@@ -340,6 +363,33 @@ mod tests {
     #[test]
     fn webhook_batch_max_is_ten() {
         assert_eq!(WEBHOOK_BATCH_MAX, 10);
+    }
+
+    #[tokio::test]
+    async fn saturated_delivery_keeps_the_batch_with_the_worker() {
+        let (_tx, rx) = mpsc::channel(1);
+        let worker = WebhookWorker {
+            url: String::new(),
+            key: String::new(),
+            secret: String::new(),
+            client: reqwest::Client::new(),
+            rx,
+            batch_interval_ms: 1000,
+            semaphore: Arc::new(Semaphore::new(0)),
+            shutdown: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+            metrics: Arc::new(Metrics::new()),
+        };
+        let mut batch = vec![WebhookEvent::channel_occupied("room")];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                worker.flush(&mut batch)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(batch.len(), 1);
     }
 
     #[tokio::test]

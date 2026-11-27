@@ -32,10 +32,17 @@ pub async fn terminate(
         );
     }
 
-    state
+    if let Err(error) = state
         .adapter
-        .terminate_user_connections(&app_id, &user_id)
-        .await;
+        .try_terminate_user_connections(&app_id, &user_id)
+        .await
+    {
+        tracing::warn!(%error, "Cluster termination incomplete");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Cluster termination incomplete"})),
+        );
+    }
 
     (StatusCode::OK, Json(serde_json::json!({})))
 }

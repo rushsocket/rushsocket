@@ -15,8 +15,8 @@ use crate::state::AppState;
 
 pub fn create_router(state: Arc<AppState>) -> Router {
     let config = &state.config;
-    let event_limit = config.max_http_event_body_kb * 1024;
-    let batch_limit = config.max_http_batch_body_kb * 1024;
+    let event_limit = config.max_http_event_body_kb.saturating_mul(1024);
+    let batch_limit = config.max_http_batch_body_kb.saturating_mul(1024);
     let concurrency = config.max_concurrent_http_requests;
 
     let x_request_id = HeaderName::from_static("x-request-id");
@@ -66,7 +66,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
                     },
                 ))
                 .layer(tower::load_shed::LoadShedLayer::new())
-                .layer(tower::limit::ConcurrencyLimitLayer::new(concurrency)),
+                .layer(tower::limit::GlobalConcurrencyLimitLayer::new(concurrency)),
         )
     } else {
         api_routes

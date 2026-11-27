@@ -77,11 +77,11 @@ pub async fn trigger_batch(
                 Json(serde_json::json!({"error": "Event name too long"})),
             );
         }
-        if event.data.len() > app.max_event_payload_in_kb * 1024 {
+        if event.data.len() > app.max_event_payload_in_kb.saturating_mul(1024) {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(
-                    serde_json::json!({"error": format!("The data content of this event exceeds the allowed maximum ({})", app.max_event_payload_in_kb * 1024)}),
+                    serde_json::json!({"error": format!("The data content of this event exceeds the allowed maximum ({})", app.max_event_payload_in_kb.saturating_mul(1024))}),
                 ),
             );
         }
@@ -140,15 +140,22 @@ pub async fn trigger_batch(
                 .await;
         }
 
-        state
+        if let Err(error) = state
             .adapter
-            .send_to_channel(
+            .try_send_to_channel(
                 &app_id,
                 &event.channel,
                 bytes::Bytes::from(msg_json),
                 event.socket_id.as_deref(),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(%error, "Event delivery incomplete");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Event delivery incomplete"})),
+            );
+        }
 
         // Collect info if requested (per-event or global)
         let info_param = event.info.as_deref().or(global_info.as_deref());

@@ -78,8 +78,8 @@ pub async fn handle(state: &Arc<AppState>, conn: &Arc<WsConnection>, msg: &Clien
         return;
     }
 
-    // Check payload size (estimate without allocating a full JSON string)
-    if estimate_json_size(&msg.data) > conn.app.max_event_payload_in_kb * 1024 {
+    // Include JSON escaping in the wire size.
+    if msg.data.to_string().len() > conn.app.max_event_payload_in_kb.saturating_mul(1024) {
         conn.send(&ServerMessage::error("Event payload too large", Some(4009)));
         return;
     }
@@ -109,34 +109,4 @@ pub async fn handle(state: &Arc<AppState>, conn: &Arc<WsConnection>, msg: &Clien
             Some(&conn.socket_id),
         )
         .await;
-}
-
-/// Estimate the serialized JSON size of a `serde_json::Value` without allocating.
-fn estimate_json_size(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Null => 4,        // "null"
-        serde_json::Value::Bool(true) => 4,  // "true"
-        serde_json::Value::Bool(false) => 5, // "false"
-        serde_json::Value::Number(n) => {
-            // Estimate: digits + sign + decimal point
-            let s = n.to_string();
-            s.len()
-        }
-        serde_json::Value::String(s) => s.len() + 2, // quotes; under-counts escapes, safe for limit check
-        serde_json::Value::Array(arr) => {
-            // brackets + commas + elements
-            let inner: usize = arr.iter().map(estimate_json_size).sum();
-            let commas = if arr.len() > 1 { arr.len() - 1 } else { 0 };
-            2 + inner + commas
-        }
-        serde_json::Value::Object(map) => {
-            // braces + key:value pairs + commas
-            let inner: usize = map
-                .iter()
-                .map(|(k, v)| k.len() + 2 + 1 + estimate_json_size(v)) // "key":value
-                .sum();
-            let commas = if map.len() > 1 { map.len() - 1 } else { 0 };
-            2 + inner + commas
-        }
-    }
 }

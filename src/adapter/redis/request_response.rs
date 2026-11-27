@@ -8,6 +8,10 @@ pub enum RequestType {
         app_id: String,
         channel: String,
     },
+    TerminateUser {
+        app_id: String,
+        user_id: String,
+    },
     /// Lightweight ping used for peer discovery on startup/reconnect.
     DiscoverPeers,
 }

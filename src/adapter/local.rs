@@ -40,6 +40,19 @@ impl LocalAdapter {
         self.namespaces.get(app_id).map(|ns| ns.clone())
     }
 
+    /// Close signed-in sessions if this node loses the channel carrying revocations.
+    pub(crate) fn close_signed_in_sockets(&self) {
+        for ns in self.namespaces.iter() {
+            for user in ns.users.iter() {
+                for id in user.value() {
+                    if let Some(socket) = ns.sockets.get(id.as_str()) {
+                        socket.force_close();
+                    }
+                }
+            }
+        }
+    }
+
     /// Get all app IDs that have active namespaces.
     pub fn get_app_ids(&self) -> Vec<String> {
         self.namespaces.iter().map(|e| e.key().clone()).collect()

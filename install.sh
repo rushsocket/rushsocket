@@ -77,7 +77,7 @@ if [ ! -f "${CONFIG_DIR}/config.toml" ]; then
     echo "Installing default config to ${CONFIG_DIR}/config.toml..."
     GEN_SECRET="$(openssl rand -hex 16)"
     GEN_KEY="$(openssl rand -hex 8)"
-    cat > "${CONFIG_DIR}/config.toml" << TOML
+    cat > "${TMPDIR}/config.toml" << TOML
 # rushsocket configuration (Linux). macOS: cargo run; Windows is not supported.
 # Bind 0.0.0.0 only if you intend to listen on all interfaces.
 
@@ -93,9 +93,12 @@ id = "rushsocket-id"
 key = "${GEN_KEY}"
 secret = "${GEN_SECRET}"
 TOML
+    install -m 600 "${TMPDIR}/config.toml" "${CONFIG_DIR}/config.toml"
 else
     echo "Config already exists at ${CONFIG_DIR}/config.toml — skipping."
 fi
+
+chmod go-rwx "${CONFIG_DIR}/config.toml"
 
 # 6. Install systemd service
 echo "Installing systemd service..."
@@ -124,7 +127,9 @@ UNIT
 # 7. Enable and start
 echo "Enabling and starting rushsocket..."
 systemctl daemon-reload
-systemctl enable --now rushsocket
+systemctl enable rushsocket
+# Type=notify waits for the new process to bind and finish adapter discovery.
+systemctl restart rushsocket
 
 # Read ports from config (fall back to defaults)
 WS_PORT=$(grep -E '^\s*port\s*=' "${CONFIG_DIR}/config.toml" 2>/dev/null | head -1 | sed 's/.*=\s*//' | tr -d ' "' || true)

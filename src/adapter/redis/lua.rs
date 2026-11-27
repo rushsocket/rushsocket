@@ -51,65 +51,6 @@ end
 return {1, sum}
 "#;
 
-/// Presence add: HLEN/HEXISTS/HINCRBY/HSET in one eval.
-/// KEYS[1] presence hash, KEYS[2] psock hash
-/// ARGV[1] user_id, ARGV[2] user_info JSON, ARGV[3] max_members
-/// Returns {accepted, is_new} as 0/1.
-pub const PRESENCE_ADD_LUA: &str = r#"
-local presence = KEYS[1]
-local psock = KEYS[2]
-local user_id = ARGV[1]
-local info = ARGV[2]
-local max_members = tonumber(ARGV[3])
-
-local exists = redis.call('HEXISTS', presence, user_id)
-if exists == 0 then
-  local count = redis.call('HLEN', presence)
-  if count >= max_members then
-    return {0, 0}
-  end
-end
-
-redis.call('HINCRBY', psock, user_id, 1)
-local is_new = 0
-if exists == 0 then
-  redis.call('HSET', presence, user_id, info)
-  is_new = 1
-end
-return {1, is_new}
-"#;
-
-/// Presence remove: never HDEL the user if post-decrement count > 0.
-/// KEYS[1] presence hash, KEYS[2] psock hash
-/// ARGV[1] user_id
-/// Returns 1 if the user is gone, 0 otherwise.
-pub const PRESENCE_REMOVE_LUA: &str = r#"
-local presence = KEYS[1]
-local psock = KEYS[2]
-local user_id = ARGV[1]
-
-if redis.call('HEXISTS', psock, user_id) == 0 then
-  redis.call('HDEL', presence, user_id)
-  if redis.call('HLEN', presence) == 0 then
-    redis.call('DEL', presence)
-    redis.call('DEL', psock)
-  end
-  return 1
-end
-
-local count = redis.call('HINCRBY', psock, user_id, -1)
-if count <= 0 then
-  redis.call('HDEL', presence, user_id)
-  redis.call('HDEL', psock, user_id)
-  if redis.call('HLEN', presence) == 0 then
-    redis.call('DEL', presence)
-    redis.call('DEL', psock)
-  end
-  return 1
-end
-return 0
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,20 +63,5 @@ mod tests {
         assert!(QUOTA_LUA.contains("HDEL"));
         assert!(!QUOTA_LUA.contains("HINCRBY"));
         assert!(QUOTA_LUA.contains("limit >= 0"));
-    }
-
-    #[test]
-    fn presence_add_lua_is_single_eval() {
-        assert!(PRESENCE_ADD_LUA.contains("HLEN"));
-        assert!(PRESENCE_ADD_LUA.contains("HEXISTS"));
-        assert!(PRESENCE_ADD_LUA.contains("HINCRBY"));
-        assert!(PRESENCE_ADD_LUA.contains("HSET"));
-    }
-
-    #[test]
-    fn presence_remove_lua_keeps_user_when_count_positive() {
-        assert!(PRESENCE_REMOVE_LUA.contains("HINCRBY"));
-        assert!(PRESENCE_REMOVE_LUA.contains("count <= 0"));
-        assert!(PRESENCE_REMOVE_LUA.contains("HDEL"));
     }
 }

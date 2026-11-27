@@ -459,3 +459,52 @@ async fn trigger_status(base: &str, body: &str) -> u16 {
         .status()
         .as_u16()
 }
+
+#[tokio::test]
+async fn api_routes_share_capacity_while_health_remains_available() {
+    use axum::body::{Body, Bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let cfg = Config {
+        max_concurrent_http_requests: 1,
+        ..Config::default()
+    };
+    let (app, _) = build_app(cfg).await.unwrap();
+    let (reading_tx, reading_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let body = Body::from_stream(futures_util::stream::once(async move {
+        reading_tx.send(()).unwrap();
+        finish_rx.await.unwrap();
+        Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
+    }));
+    let post = Request::post(format!("/apps/{APP_ID}/events"))
+        .body(body)
+        .unwrap();
+    let pending = tokio::spawn(app.clone().oneshot(post));
+    tokio::time::timeout(Duration::from_secs(3), reading_rx)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let get = |path: &str| Request::get(path).body(Body::empty()).unwrap();
+    let result = app
+        .clone()
+        .oneshot(get(&format!("/apps/{APP_ID}/channels")))
+        .await
+        .unwrap();
+    assert_eq!(result.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        app.clone().oneshot(get("/ready")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    finish_tx.send(()).unwrap();
+    pending.await.unwrap().unwrap();
+    assert_eq!(
+        app.oneshot(get(&format!("/apps/{APP_ID}/channels")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}

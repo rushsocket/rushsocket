@@ -69,6 +69,19 @@ pub trait Adapter: Send + Sync + 'static {
         excepting_id: Option<&str>,
     );
 
+    /// Report a publish failure to a caller that can return a retryable error.
+    async fn try_send_to_channel(
+        &self,
+        app_id: &str,
+        channel: &str,
+        message: Bytes,
+        excepting_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.send_to_channel(app_id, channel, message, excepting_id)
+            .await;
+        Ok(())
+    }
+
     /// Get the connection count for an app.
     async fn get_connection_count(&self, app_id: &str) -> usize;
 
@@ -148,6 +161,15 @@ pub trait Adapter: Send + Sync + 'static {
 
     /// Terminate all connections for a user in an app.
     async fn terminate_user_connections(&self, app_id: &str, user_id: &str);
+
+    async fn try_terminate_user_connections(
+        &self,
+        app_id: &str,
+        user_id: &str,
+    ) -> anyhow::Result<()> {
+        self.terminate_user_connections(app_id, user_id).await;
+        Ok(())
+    }
 
     /// Get a socket by its ID.
     async fn get_socket(&self, app_id: &str, socket_id: &str) -> Option<Arc<WsConnection>>;

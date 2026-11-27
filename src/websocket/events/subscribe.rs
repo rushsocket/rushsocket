@@ -214,7 +214,7 @@ pub async fn handle(state: &Arc<AppState>, conn: &Arc<WsConnection>, msg: &Clien
 
             // Check member size limit
             let member_json = serde_json::to_string(&channel_data).unwrap_or_default();
-            if member_json.len() > conn.app.max_presence_member_size_in_kb * 1024 {
+            if member_json.len() > conn.app.max_presence_member_size_in_kb.saturating_mul(1024) {
                 send_subscription_error(conn, &channel, "Member data too large", 403);
                 return;
             }

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.2.0 - 2026-11-28
+
+**Redis upgrade:** Drain and stop all v1.1.0 or earlier nodes before starting v1.2.0. The presence key format and termination protocol have changed. Clients rebuild presence when they reconnect. Preserve Redis cache keys.
+
+- Fixed the built-in TLS listener abort when both rustls crypto providers are linked. Updated the locked dependencies.
+- Redis connections recover after a restart. Readiness waits for peer discovery and state restoration. Crashed nodes’ presence rosters expire and concurrent joins protect the occupancy claim.
+- Cluster termination waits for peer acknowledgements. A node that loses its revocation subscription closes signed-in sockets. Incomplete termination or event publication returns HTTP 503.
+- Bounded WebSocket reads, writes, webhook backlog and delivery concurrency. Queued webhooks can drain during shutdown. HTTP API routes share the configured concurrency limit.
+- Protected generated credentials, removed sensitive URLs from logs, and fixed systemd startup notification and installer restarts on upgrade.
+
 ## 1.1.0 - 2026-08-23
 
 ### Performance

@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::app::App;
 use crate::protocol::messages::ServerMessage;
@@ -22,7 +23,7 @@ pub struct WsConnection {
     /// Whether a server ping has been sent and we're waiting for pong
     pinged: AtomicBool,
     /// Set when the outbound channel is full (slow consumer); connection will be closed.
-    force_close: AtomicBool,
+    force_close: CancellationToken,
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +42,7 @@ impl WsConnection {
             presence: Mutex::new(HashMap::new()),
             user: Mutex::new(None),
             pinged: AtomicBool::new(false),
-            force_close: AtomicBool::new(false),
+            force_close: CancellationToken::new(),
         }
     }
 
@@ -53,19 +54,23 @@ impl WsConnection {
         if self.tx.try_send(json).is_ok() {
             true
         } else {
-            self.force_close.store(true, Ordering::Relaxed);
+            self.force_close.cancel();
             false
         }
     }
 
     /// Whether the connection should be forcefully closed (slow consumer or terminated).
     pub fn should_close(&self) -> bool {
-        self.force_close.load(Ordering::Relaxed)
+        self.force_close.is_cancelled()
     }
 
     /// Mark this connection for forced closure (used by terminate API).
     pub fn force_close(&self) {
-        self.force_close.store(true, Ordering::Relaxed);
+        self.force_close.cancel();
+    }
+
+    pub async fn closed(&self) {
+        self.force_close.cancelled().await;
     }
 
     /// Mark that we sent a server ping and are waiting for pong.

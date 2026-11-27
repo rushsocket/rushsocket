@@ -1,6 +1,6 @@
 [package]
 name = "rushsocket"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "A Pusher Protocol v7 compatible WebSocket server written in Rust"
 license = "MIT OR Apache-2.0"
@@ -10,6 +10,7 @@ repository = "https://github.com/rushsocket/rushsocket"
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # HTTP + WebSocket
 axum = { version = "0.8", features = ["ws"] }
@@ -18,6 +19,7 @@ tower-http = { version = "0.6", features = ["cors", "request-id"] }
 
 # TLS
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -73,9 +75,10 @@ tikv-jemallocator = "0.6"
 sd-notify = "0.4"
 
 [dev-dependencies]
+tempfile = "3"
 tokio-tungstenite = "0.26"
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "time"] }
 serde_json = "1"
 futures-util = "0.3"
 axum = { version = "0.8", features = ["ws"] }

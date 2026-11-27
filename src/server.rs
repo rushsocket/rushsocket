@@ -21,6 +21,10 @@ use crate::websocket;
 /// Build the application router and shared state from config.
 /// Extracted so integration tests can reuse this without the bind/serve logic.
 pub async fn build_app(config: Config) -> anyhow::Result<(Router, Arc<AppState>)> {
+    // Both ring and aws-lc-rs are linked. Select a default before building
+    // webhook clients or the TLS listener, preserving any caller-installed provider.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let app_manager = Arc::new(StaticAppManager::new(config.apps.clone()));
 
     let state = match config.adapter.as_str() {
@@ -39,18 +43,12 @@ pub async fn build_app(config: Config) -> anyhow::Result<(Router, Arc<AppState>)
             ))
         }
         "redis" => {
-            info!("Using Redis adapter ({})", config.redis.url);
+            info!("Using Redis adapter");
             let metrics = Arc::new(crate::metrics::Metrics::new());
-            let adapter = Arc::new(
-                RedisAdapter::new(&config.redis, metrics.clone())
-                    .await
-                    .expect("Failed to connect to Redis"),
-            );
+            let adapter = Arc::new(RedisAdapter::new(&config.redis, metrics.clone()).await?);
             adapter.start_listening().await;
-            let cache: Arc<dyn CacheDriver> = Arc::new(
-                RedisCache::new(&config.redis.url, &config.redis.prefix)
-                    .expect("Failed to create Redis cache pool"),
-            );
+            let cache: Arc<dyn CacheDriver> =
+                Arc::new(RedisCache::new(&config.redis.url, &config.redis.prefix)?);
             info!("Using Redis cache");
             Arc::new(AppState::new_with_cache(
                 config,
@@ -89,6 +87,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     })?;
     let addr = SocketAddr::from((host, config.port));
 
+    let listener = TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
+    let listener = listener.into_std()?;
     let (app, state) = build_app(config.clone()).await?;
 
     // Metrics server (separate port, always plain HTTP)
@@ -213,25 +214,31 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let tls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
 
+        let server = axum_server::from_tcp_rustls(listener, tls_config)?;
         info!("rushsocket listening on {} (TLS)", addr);
         wait_until_ready(&state).await?;
         notify_ready();
 
-        axum_server::bind_rustls(addr, tls_config)
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await?;
+        server.handle(handle).serve(app.into_make_service()).await?;
     } else {
+        let server = axum_server::from_tcp(listener)?;
         info!("rushsocket listening on {}", addr);
         wait_until_ready(&state).await?;
         notify_ready();
 
-        axum_server::bind(addr)
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await?;
+        server.handle(handle).serve(app.into_make_service()).await?;
     }
 
+    if let Some(webhooks) = &state.webhooks
+        && tokio::time::timeout(
+            std::time::Duration::from_secs(grace_period),
+            webhooks.drain(),
+        )
+        .await
+        .is_err()
+    {
+        warn!("Webhook deliveries still pending at shutdown deadline");
+    }
     info!("rushsocket shut down gracefully");
     Ok(())
 }
@@ -514,7 +521,7 @@ async fn wait_until_ready(state: &AppState) -> anyhow::Result<()> {
 /// Notify systemd that the service is ready (no-op on non-Linux).
 #[cfg(target_os = "linux")]
 fn notify_ready() {
-    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -522,7 +529,7 @@ fn notify_ready() {}
 
 #[cfg(target_os = "linux")]
 fn notify_stopping() {
-    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Stopping]);
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
 }
 
 #[cfg(not(target_os = "linux"))]

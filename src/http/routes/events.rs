@@ -109,11 +109,11 @@ pub async fn trigger(
         );
     }
 
-    if req.data.len() > app.max_event_payload_in_kb * 1024 {
+    if req.data.len() > app.max_event_payload_in_kb.saturating_mul(1024) {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(
-                serde_json::json!({"error": format!("The data content of this event exceeds the allowed maximum ({})", app.max_event_payload_in_kb * 1024)}),
+                serde_json::json!({"error": format!("The data content of this event exceeds the allowed maximum ({})", app.max_event_payload_in_kb.saturating_mul(1024))}),
             ),
         );
     }
@@ -158,15 +158,22 @@ pub async fn trigger(
                 .await;
         }
 
-        state
+        if let Err(error) = state
             .adapter
-            .send_to_channel(
+            .try_send_to_channel(
                 &app_id,
                 channel,
                 bytes::Bytes::from(msg_json),
                 req.socket_id.as_deref(),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(%error, "Event delivery incomplete");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Event delivery incomplete"})),
+            );
+        }
 
         // Collect channel info if requested
         if want_info {

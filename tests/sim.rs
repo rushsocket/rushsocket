@@ -941,11 +941,8 @@ async fn redis_two_node_occupancy_webhook_once() {
     let deadline = Instant::now() + Duration::from_secs(18);
     loop {
         let vacated_hooks = drain_named(&events, "channel_vacated", "public-occ");
-        let redis_occ = occupancy_key(&occ_key);
-        if vacated_hooks >= 1
-            || redis_occ.as_deref() == Some("")
-            || redis_occ.as_deref() == Some("(nil)")
-        {
+        let redis_occ = occupancy_key(&occ_key).await;
+        if vacated_hooks >= 1 || redis_occ.is_none() {
             break;
         }
         if Instant::now() >= deadline {
@@ -999,11 +996,9 @@ async fn redis_two_node_vacate_under_fanout() {
         "{}:occupied:{}:public-hol",
         responder.state.config.redis.prefix, APP_ID
     );
-    let redis_occ = occupancy_key(&occ_key);
+    let redis_occ = occupancy_key(&occ_key).await;
     assert!(
-        redis_occ
-            .as_deref()
-            .is_some_and(|v| !v.is_empty() && v != "(nil)"),
+        redis_occ.is_some(),
         "occupancy must remain while responder still has 64 sockets; redis_occ={redis_occ:?}"
     );
     assert_eq!(
@@ -1024,8 +1019,8 @@ async fn redis_two_node_vacate_under_fanout() {
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let redis_occ = occupancy_key(&occ_key);
-        if redis_occ.as_deref() == Some("") || redis_occ.as_deref() == Some("(nil)") {
+        let redis_occ = occupancy_key(&occ_key).await;
+        if redis_occ.is_none() {
             break;
         }
         if Instant::now() >= deadline {
@@ -1037,12 +1032,14 @@ async fn redis_two_node_vacate_under_fanout() {
     }
 }
 
-fn occupancy_key(key: &str) -> Option<String> {
-    std::process::Command::new("redis-cli")
-        .args(["GET", key])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+async fn occupancy_key(key: &str) -> Option<String> {
+    let client = redis::Client::open(redis_url().expect("test Redis URL")).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("GET")
+        .arg(key)
+        .query_async(&mut conn)
+        .await
+        .unwrap()
 }
 
 /// 5000-connection scale. Skipped in default `cargo test` (listen backlog + RAM).

@@ -4,6 +4,7 @@ pub mod lifecycle;
 pub mod socket_id;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
@@ -58,16 +59,52 @@ pub async fn ws_handler(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    ws.read_buffer_size(4096)
-        .write_buffer_size(4096)
-        .max_write_buffer_size(65536)
-        .on_upgrade(move |socket| handle_socket(socket, key, origin, state))
+    let app = state.app_manager.find_by_key(&key);
+    let limit = app
+        .as_ref()
+        .map_or(0, |app| app.max_message_size_in_kb.saturating_mul(1024));
+    ws.max_message_size(limit)
+        .max_frame_size(limit)
+        .read_buffer_size(4096)
+        .write_buffer_size(0)
+        .on_upgrade(move |socket| handle_socket(socket, app, origin, state))
         .into_response()
+}
+
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn reject(mut socket: WebSocket, message: ServerMessage) {
+    let _ = tokio::time::timeout(WRITE_TIMEOUT, async {
+        socket.send(Message::Text(message.to_json().into())).await?;
+        socket.close().await
+    })
+    .await;
+}
+
+struct Writer<'a> {
+    sink: futures_util::stream::SplitSink<WebSocket, Message>,
+    conn: &'a WsConnection,
+}
+
+impl Writer<'_> {
+    async fn send(&mut self, message: Message) -> Result<(), ()> {
+        tokio::select! {
+            biased;
+            _ = self.conn.closed() => Err(()),
+            result = tokio::time::timeout(WRITE_TIMEOUT, self.sink.send(message)) => {
+                result.map_err(|_| ())?.map_err(|_| ())
+            }
+        }
+    }
+
+    async fn close(&mut self) {
+        let _ = tokio::time::timeout(Duration::from_millis(250), self.sink.close()).await;
+    }
 }
 
 async fn handle_socket(
     socket: WebSocket,
-    key: String,
+    app: Option<Arc<crate::app::App>>,
     origin: Option<String>,
     state: Arc<AppState>,
 ) {
@@ -77,32 +114,26 @@ async fn handle_socket(
     }
 
     // Look up app by key
-    let app = match state.app_manager.find_by_key(&key) {
+    let app = match app {
         Some(app) => app,
         None => {
-            let (mut sink, _) = socket.split();
             let err = ServerMessage::error("Could not find app", Some(error_codes::UNKNOWN_APP));
-            let _ = sink.send(Message::Text(err.to_json().into())).await;
-            let _ = sink.close().await;
+            reject(socket, err).await;
             return;
         }
     };
 
     // Check if app is enabled
     if !app.enabled {
-        let (mut sink, _) = socket.split();
         let err = ServerMessage::error("Application is disabled", Some(error_codes::APP_DISABLED));
-        let _ = sink.send(Message::Text(err.to_json().into())).await;
-        let _ = sink.close().await;
+        reject(socket, err).await;
         return;
     }
 
     // Validate origin
     if !validate_origin(origin.as_deref(), &app.allowed_origins) {
-        let (mut sink, _) = socket.split();
         let err = ServerMessage::error("Origin not allowed", Some(4009));
-        let _ = sink.send(Message::Text(err.to_json().into())).await;
-        let _ = sink.close().await;
+        reject(socket, err).await;
         return;
     }
 
@@ -112,10 +143,8 @@ async fn handle_socket(
     if state.config.memory_threshold_percent > 0.0 {
         let usage = state.cached_memory_percent();
         if usage >= state.config.memory_threshold_percent {
-            let (mut sink, _) = socket.split();
             let err = ServerMessage::error("Memory usage too high", Some(4009));
-            let _ = sink.send(Message::Text(err.to_json().into())).await;
-            let _ = sink.close().await;
+            reject(socket, err).await;
             return;
         }
     }
@@ -156,30 +185,27 @@ async fn run_connection(
     {
         crate::adapter::Admit::Ok => {}
         crate::adapter::Admit::OverQuota => {
-            let (mut sink, _) = socket.split();
             let err = ServerMessage::error(
                 "Over connection quota",
                 Some(error_codes::APP_OVER_CONNECTION_QUOTA),
             );
-            let _ = sink.send(Message::Text(err.to_json().into())).await;
-            let _ = sink.close().await;
+            reject(socket, err).await;
             return;
         }
         crate::adapter::Admit::Unavailable => {
-            let (mut sink, _) = socket.split();
             let err = ServerMessage::error(
                 "Connection unavailable",
                 Some(error_codes::CONNECTION_UNAVAILABLE),
             );
-            let _ = sink.send(Message::Text(err.to_json().into())).await;
-            let _ = sink.close().await;
+            reject(socket, err).await;
             return;
         }
     }
     state.metrics.on_connect(&app_id);
 
     // Split socket
-    let (mut sink, mut stream) = socket.split();
+    let (sink, mut stream) = socket.split();
+    let mut sink = Writer { sink, conn: &conn };
 
     // Send connection_established
     let established =
@@ -202,7 +228,7 @@ async fn run_connection(
 
     let ping_interval_secs = state.config.server_ping_interval;
     let pong_timeout_secs = state.config.server_pong_timeout;
-    let max_message_bytes = app.max_message_size_in_kb * 1024;
+    let max_message_bytes = app.max_message_size_in_kb.saturating_mul(1024);
 
     // Single select! loop: handles inbound messages, outbound sends, and activity timeout.
     // This eliminates 2 spawned tasks per connection (send_task + activity_timer).
@@ -216,10 +242,9 @@ async fn run_connection(
 
     let mut closing_rx = state.closing_rx.clone();
 
-    async fn emit_closing(sink: &mut (impl SinkExt<Message> + Unpin)) {
+    async fn emit_closing(sink: &mut Writer<'_>) {
         let err = ServerMessage::error("Server is closing", Some(error_codes::SERVER_CLOSING));
         let _ = sink.send(Message::Text(err.to_json().into())).await;
-        let _ = sink.close().await;
     }
 
     loop {
@@ -238,6 +263,7 @@ async fn run_connection(
                 emit_closing(&mut sink).await;
                 break;
             }
+            _ = conn.closed() => break,
             result = stream.next() => {
                 match result {
                     Some(Ok(Message::Text(text))) => {
@@ -307,7 +333,7 @@ async fn run_connection(
     }
 
     // Cleanup
-    let _ = sink.close().await;
+    sink.close().await;
     lifecycle::on_close(&state, &conn).await;
     state.metrics.on_disconnect(&app_id);
 
